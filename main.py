@@ -7,7 +7,7 @@ from get_price import get_price
 from email_alert import send_alert
 import os
 
-def load_auctions_from_files(folder="aukcje"):
+def load_auctions_from_files(folder="."):
     auctions = []
     for filename in os.listdir(folder):
         if filename.endswith(".txt"):
@@ -41,5 +41,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
