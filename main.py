@@ -1,32 +1,38 @@
-import smtplib
-from email.mime.text import MIMEText
 from get_price import get_price
+from email_alert import send_alert
+import os
 
-# Funkcja do wysyłki maila
-def send_email(body: str):
-    recipients = ["zamowienia@biobakt.pl", "kuba.karbowski455@gmail.com"]
-    sender = "kuba.karbowski455@gmail.com"  # <- Ustaw adres nadawcy (Gmail najlepiej)
-    password = "vfnv resn xqrb fuac"  # <- Hasło aplikacji (nie zwykłe hasło do Gmaila!)
+def load_auctions_from_files(folder="aukcje"):
+    auctions = []
+    for filename in os.listdir(folder):
+        if filename.endswith(".txt"):
+            filepath = os.path.join(folder, filename)
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split(";")
+                    if len(parts) == 2:
+                        auction_id, min_price = parts
+                        auctions.append({
+                            "id": auction_id.strip(),
+                            "min_price": float(min_price.strip()),
+                            "product": filename.replace(".txt", "")
+                        })
+    return auctions
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = "📉 Alert cenowy Allegro – wykryto zaniżoną cenę!"
-    msg["From"] = sender
-    msg["To"] = ", ".join(recipients)
+def main():
+    auctions = load_auctions_from_files()
+    alerts = []
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(sender, password)
-        server.sendmail(sender, recipients, msg.as_string())
+    for auction in auctions:
+        try:
+            price = get_price(auction["id"])
+            if price < auction["min_price"]:
+                alerts.append(f'{auction["product"]}: Aukcja {auction["id"]} ma cenę {price:.2f} zł (min: {auction["min_price"]:.2f} zł)')
+        except Exception as e:
+            alerts.append(f'{auction["product"]}: Błąd sprawdzania aukcji {auction["id"]}: {str(e)}')
 
-# Główna logika
+    if alerts:
+        send_alert(alerts)
+
 if __name__ == "__main__":
-    print("🔍 Sprawdzam ceny...")
-    underpriced_auctions = get_price()
-
-    if underpriced_auctions:
-        email_body = "Wykryto oferty z ceną poniżej ustalonego minimum:\n\n"
-        email_body += "\n".join(underpriced_auctions)
-        print("📬 Wysyłam e-mail...")
-        send_email(email_body)
-        print("✅ E-mail został wysłany!")
-    else:
-        print("✅ Wszystkie ceny są poprawne.")
+    main()
