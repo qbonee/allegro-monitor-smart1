@@ -2,8 +2,8 @@ import smtplib
 from email.mime.text import MIMEText
 
 def send_alert(alerts):
-    sender = "TWOJ_EMAIL@gmail.com"
-    password = "TWOJE_HASLO_LUB_APP_PASSWORD"
+    sender = "kuba.karbowski455@gmail.com"
+    password = "omzn oguj kgeu zfvf"
 
     recipients = [
         "zamowienia@biobakt.pl",
