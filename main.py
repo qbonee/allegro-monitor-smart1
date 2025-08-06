@@ -1,3 +1,5 @@
+print("== Start programu ==")
+
 from get_price import get_price
 from email_alert import send_alert
 import os
@@ -36,3 +38,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
