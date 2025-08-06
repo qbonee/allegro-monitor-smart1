@@ -1,4 +1,7 @@
-print("== Start programu ==")
+print("Zawartość katalogu roboczego:")
+print(os.listdir("."))
+print("Zawartość folderu aukcje:")
+print(os.listdir("aukcje"))
 
 from get_price import get_price
 from email_alert import send_alert
@@ -38,4 +41,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
