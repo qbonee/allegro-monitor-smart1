@@ -1,0 +1,1 @@
+# allegro-monitor-smart1
