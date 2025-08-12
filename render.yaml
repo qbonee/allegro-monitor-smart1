@@ -2,12 +2,15 @@ services:
   - type: cron
     name: allegro-monitor-cron
     runtime: python
-    schedule: "0 */3 * * *"     # co 3 godziny
-    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
-    startCommand: >
-      bash -lc "
-      pip install --upgrade pip setuptools wheel &&
-      pip install -r requirements.txt --no-cache-dir &&
-      PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 PLAYWRIGHT_BROWSERS_PATH=.cache/ms-playwright python -m playwright install chromium &&
-      PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 PLAYWRIGHT_BROWSERS_PATH=.cache/ms-playwright python main.py
-      "
+    schedule: "0 */3 * * *"   # co 3 godziny
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
+      # POBRANIE CHROMIUM – bez --with-deps
+      PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 \
+      PLAYWRIGHT_BROWSERS_PATH=.cache/ms-playwright \
+      python -m playwright install chromium
+    startCommand: |
+      PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 \
+      PLAYWRIGHT_BROWSERS_PATH=.cache/ms-playwright \
+      python main.py
