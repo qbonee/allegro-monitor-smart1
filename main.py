@@ -1,19 +1,18 @@
 import os
+import time
 from get_price import get_price
 from email_alert import send_alert
 
-# --- pomocnicze --------------------------------------------------------------
+# ===== Helpers ===============================================================
 
 def parse_price(text: str) -> float:
-    """
-    Zamienia '40zł', '40 zł', '40,00' -> 40.0
-    """
-    t = text.lower().replace("zł", "").replace(" ", "").replace(",", ".")
+    """'40zł' / '40 zł' / '40,00' -> 40.0"""
+    t = (text or "").lower().replace("zł", "").replace(" ", "").replace(",", ".")
     return float(t)
 
 def load_auctions_from_files(folder: str = "."):
     """
-    Czyta wszystkie .txt w folderze i obsługuje dwa formaty:
+    Obsługuje dwa formaty .txt:
 
     A) Nagłówek + ID:
        cena minimalna: 129 zł
@@ -23,11 +22,8 @@ def load_auctions_from_files(folder: str = "."):
     B) Wiersze 'ID;MIN':
        1234567890;129
        9876543210;199.90
-
-    Zwraca listę: [{id, min_price, product}, ...]
     """
     auctions = []
-
     for filename in os.listdir(folder):
         if not filename.endswith(".txt"):
             continue
@@ -41,7 +37,7 @@ def load_auctions_from_files(folder: str = "."):
 
             product = filename.replace(".txt", "")
 
-            # Format B: "ID;MIN"
+            # Format B: ID;MIN
             if any(";" in ln for ln in lines):
                 for ln in lines:
                     if ";" not in ln:
@@ -68,26 +64,32 @@ def load_auctions_from_files(folder: str = "."):
         except Exception as e:
             print(f"[WARN] Nie udało się wczytać pliku {filename}: {e}")
 
-    return auctions
+    # de-duplikacja (na wszelki wypadek)
+    seen = set()
+    uniq = []
+    for a in auctions:
+        key = (a["product"], a["id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(a)
 
-# --- główna logika -----------------------------------------------------------
+    return uniq
+
+# ===== Main ==================================================================
 
 def main():
     print("== Start programu ==")
-    print("Pliki w katalogu roboczym:", os.listdir("."))
-
     auctions = load_auctions_from_files(".")
     print(f"Wczytano {len(auctions)} aukcji do sprawdzenia.")
 
     alerts = []   # tylko realne zaniżenia cen
-    errors = []   # trafią do logów, NIE do e-maila
+    errors = []   # do logów
 
-    for a in auctions:
+    for idx, a in enumerate(auctions, 1):
         try:
             price = get_price(a["id"])
-            # DEBUG: odkomentuj jeśli chcesz widzieć każdą decyzję
-            # print(f"[DEBUG] {a['product']} ({a['id']}): cena={price:.2f} min={a['min_price']:.2f}")
-
+            # print(f"[DEBUG] {a['product']} ({a['id']}): {price:.2f} vs {a['min_price']:.2f}")
             if price < a["min_price"]:
                 alerts.append({
                     "product": a["product"],
@@ -97,6 +99,9 @@ def main():
                 })
         except Exception as e:
             errors.append(f"{a['product']}: Błąd sprawdzania aukcji {a['id']}: {e}")
+
+        # mały throttling dla Allegro
+        time.sleep(0.7)
 
     if alerts:
         print(f"Znaleziono {len(alerts)} zaniżonych aukcji – wysyłam e-mail…")
