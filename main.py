@@ -2,9 +2,14 @@ import os
 from get_price import get_price
 from email_alert import send_alert
 
-# (opcjonalnie) krótkie logi startowe – zostaw, bo przydają się na Renderze
 print("== Start programu ==")
 print("Zawartość katalogu roboczego:", os.listdir("."))
+
+if os.path.isdir("aukcje"):
+    print("Zawartość folderu aukcje:", os.listdir("aukcje"))
+else:
+    print("Brak folderu 'aukcje' – czytam pliki z bieżącego katalogu.")
+
 
 def parse_price(text: str) -> float:
     """Zamienia '40zł', '40 zł', '40,00' -> 40.0"""
@@ -88,3 +93,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
