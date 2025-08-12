@@ -4,22 +4,21 @@ from email.mime.text import MIMEText
 
 def send_alert(alerts):
     """
-    alerts: lista słowników:
+    alerts: lista dictów:
       {"product": "...", "id": "...", "price": 123.45, "min": 150.00}
-    Wysyła e-mail TYLKO z aukcjami, których cena spadła poniżej minimum.
+    Wysyłamy e-mail TYLKO, jeśli lista nie jest pusta.
     """
 
-    # --- KONFIG MAILA --------------------------------------------------------
-    sender = "kuba.karbowski455@gmail.com"  # nadawca (Gmail)
-    # Najlepiej użyć hasła do aplikacji z GMail (2FA włączone)
+    # --- KONFIGURACJA MAILA (Gmail) -----------------------------------------
+    sender = "kuba.karbowski455@gmail.com"               # Twój adres Gmail
+    # UŻYJ hasła do aplikacji (Gmail 2FA) lub ustaw w Render → Environment:
     password = os.getenv("GMAIL_APP_PASSWORD", "WPISZ_TUTAJ_HASLO_DO_APLIKACJI")
     recipients = [
         "zamowienia@biobakt.pl",
         "kuba.karbowski455@gmail.com",
     ]
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------------
 
-    # Treść i temat – 1 aukcja vs. wiele
     if len(alerts) == 1:
         a = alerts[0]
         subject = f"ALERT: cena poniżej minimum – {a['product']} ({a['id']})"
