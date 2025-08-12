@@ -2,7 +2,8 @@ services:
   - type: cron
     name: allegro-monitor-cron
     runtime: python
-    schedule: "@hourly"
+    schedule: "0 */3 * * *"    # co 3 godziny
     region: frankfurt
     plan: free
+    buildCommand: pip install -r requirements.txt && playwright install
     startCommand: python main.py
