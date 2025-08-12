@@ -2,8 +2,6 @@ services:
   - type: cron
     name: allegro-monitor-cron
     runtime: python
-    schedule: "0 */3 * * *"      # co 3 godziny
-    # buildCommand może zostać prosty lub pusty
+    schedule: "0 */3 * * *"   # co 3 godziny
     buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
-    # klucz: najpierw pip install (żeby był 'playwright'), potem pobieramy Chromium, na końcu main.py
-    startCommand: bash -lc "pip install --upgrade pip setuptools wheel && pip install -r requirements.txt && python -m playwright install --with-deps chromium && python main.py"
+    startCommand: bash -lc "PLAYWRIGHT_BROWSERS_PATH=.cache/ms-playwright python -m playwright install chromium && python main.py"
