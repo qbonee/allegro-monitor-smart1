@@ -2,7 +2,7 @@ services:
   - type: cron
     name: allegro-monitor-cron
     runtime: python
-    plan: free
+  
     # schedule: "0 */3 * * *"  # co 3 godziny
     schedule: "@hourly"        # testowo co godzinę; potem zmień z powrotem
     startCommand: python main.py
