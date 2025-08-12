@@ -2,6 +2,7 @@ services:
   - type: cron
     name: allegro-monitor-cron
     runtime: python
+    # region zostaw taki jak masz już w usłudze; nie próbuj go zmieniać
     schedule: "0 */3 * * *"   # co 3 godziny
-    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
-    startCommand: python main.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash -lc "python -m playwright install --with-deps chromium && python main.py"
