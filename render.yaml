@@ -3,7 +3,6 @@ services:
     name: allegro-monitor-cron
     runtime: python
     region: frankfurt
-    plan: free
     schedule: "0 */3 * * *"   # co 3 godziny
     buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
     startCommand: python main.py
