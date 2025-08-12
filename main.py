@@ -2,6 +2,12 @@ import os
 import time
 from get_price import get_price
 from email_alert import send_alert
+import subprocess
+subprocess.run(
+    "python -m playwright install --with-deps chromium",
+    shell=True, check=False
+)
+
 
 # ===== Helpers ===============================================================
 
@@ -114,3 +120,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
