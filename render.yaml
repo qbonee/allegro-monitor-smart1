@@ -2,7 +2,8 @@ services:
   - type: cron
     name: allegro-monitor-cron
     runtime: python
-    # region zostaw taki jak masz już w usłudze; nie próbuj go zmieniać
-    schedule: "0 */3 * * *"   # co 3 godziny
-    buildCommand: pip install -r requirements.txt
-    startCommand: bash -lc "python -m playwright install --with-deps chromium && python main.py"
+    schedule: "0 */3 * * *"      # co 3 godziny
+    # buildCommand może zostać prosty lub pusty
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+    # klucz: najpierw pip install (żeby był 'playwright'), potem pobieramy Chromium, na końcu main.py
+    startCommand: bash -lc "pip install --upgrade pip setuptools wheel && pip install -r requirements.txt && python -m playwright install --with-deps chromium && python main.py"
