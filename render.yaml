@@ -2,4 +2,5 @@ services:
   - type: cron
     name: allegro-monitor-cron
     runtime: python
+    schedule: "@hourly"
     startCommand: python main.py
