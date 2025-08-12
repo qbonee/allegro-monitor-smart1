@@ -2,5 +2,6 @@ services:
   - type: cron
     name: allegro-monitor-cron
     runtime: python
-    schedule: "@hourly"
+    # co 3 godziny
+    schedule: "0 */3 * * *"
     startCommand: python main.py
