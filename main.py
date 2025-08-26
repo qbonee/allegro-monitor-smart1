@@ -1,20 +1,15 @@
-# main.py
 import os
-import time
 from typing import List, Dict
 
-from get_price import get_price
 from email_alert import send_alert
+from get_price import get_price_batch
 
-
-# ============ Helpers =========================================================
+# Pliki .txt z numerami aukcji i minimami leżą w katalogu głównym repo (".").
 
 def parse_price(text: str) -> float:
-    """'40zł' / '40 zł' / '40,00' -> 40.0"""
-    t = (text or "").lower().replace("zł", "").replace("\xa0", "")
+    t = (text or "").lower().replace("zł", "").replace("\u00a0", " ")
     t = t.replace(" ", "").replace(",", ".")
     return float(t)
-
 
 def load_auctions_from_files(folder: str = ".") -> List[Dict]:
     """
@@ -30,11 +25,9 @@ def load_auctions_from_files(folder: str = ".") -> List[Dict]:
        9876543210;199.90
     """
     auctions: List[Dict] = []
-    txt_files = [f for f in os.listdir(folder) if f.endswith(".txt")]
-
-    print(f"[INFO] Znaleziono pliki TXT: {txt_files}")
-
-    for filename in txt_files:
+    for filename in os.listdir(folder):
+        if not filename.endswith(".txt"):
+            continue
         filepath = os.path.join(folder, filename)
         try:
             with open(filepath, "r", encoding="utf-8") as f:
@@ -53,7 +46,7 @@ def load_auctions_from_files(folder: str = ".") -> List[Dict]:
                     auctions.append({
                         "id": auction_id.strip(),
                         "min_price": parse_price(min_price),
-                        "product": product,
+                        "product": product
                     })
                 continue
 
@@ -65,65 +58,50 @@ def load_auctions_from_files(folder: str = ".") -> List[Dict]:
                     auctions.append({
                         "id": auction_id.strip(),
                         "min_price": min_price,
-                        "product": product,
+                        "product": product
                     })
 
         except Exception as e:
             print(f"[WARN] Nie udało się wczytać pliku {filename}: {e}")
 
     # de-duplikacja
-    uniq: List[Dict] = []
-    seen = set()
+    seen = set(); uniq: List[Dict] = []
     for a in auctions:
         key = (a["product"], a["id"])
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(a)
-
-    print(f"[INFO] Wczytano {len(uniq)} aukcji (po deduplikacji).")
+        if key in seen: continue
+        seen.add(key); uniq.append(a)
     return uniq
 
-
-# ============ Main ============================================================
-
 def main():
-    print("== Start programu ==")
-    print(f"[INFO] Katalog roboczy: {os.getcwd()}")
-
     auctions = load_auctions_from_files(".")
+    print(f"[INFO] Wczytano {len(auctions)} wpisów .txt")
+
     alerts: List[Dict] = []
     errors: List[str] = []
 
-    for idx, a in enumerate(auctions, 1):
-        print(f"[{idx}/{len(auctions)}] Sprawdzam {a['product']} ({a['id']})…")
-        try:
-            price = get_price(a["id"])
-            print(f"    -> cena: {price:.2f} zł (min: {a['min_price']:.2f} zł)")
+    if auctions:
+        results, errs = get_price_batch(auctions)
+        errors.extend(errs)
+        for a, price in results:
+            if price is None:
+                continue
             if price < a["min_price"]:
                 alerts.append({
                     "product": a["product"],
                     "id": a["id"],
                     "price": price,
                     "min": a["min_price"],
+                    "url": f"https://allegro.pl/oferta/{a['id']}",
                 })
-        except Exception as e:
-            msg = f"{a['product']}: błąd sprawdzania {a['id']}: {e}"
-            print("[ERROR]", msg)
-            errors.append(msg)
-
-        # throttling – nie bombardujemy Allegro
-        time.sleep(0.6)
 
     if alerts:
-        print(f"[INFO] Znaleziono {len(alerts)} zaniżonych aukcji – wysyłam e-mail.")
+        print(f"[INFO] ALERTY: {len(alerts)} – wysyłam e-mail.")
         send_alert(alerts)
     else:
-        print("[INFO] Brak zaniżonych cen – e-mail nie wysłany.")
+        print("[INFO] Brak zaniżonych cen.")
 
     if errors:
         print("[BŁĘDY]\n" + "\n".join(errors))
-
 
 if __name__ == "__main__":
     main()
