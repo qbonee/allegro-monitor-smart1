@@ -1,104 +1,142 @@
-# get_price.py
-import json
 import re
-from typing import Optional
+from typing import List, Dict, Tuple, Optional
+from urllib.parse import quote_plus
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-import requests
-from bs4 import BeautifulSoup
+PRICE_SEL_CANDIDATES = [
+    "span[data-testid='price']",
+    "span[itemprop='price']",
+    "meta[property='product:price:amount']",
+    "meta[property='og:price:amount']",
+]
 
+COOKIE_BUTTONS = [
+    "button[data-role='accept-consent']",
+    "button:has-text('Przejdź do serwisu')",
+    "button:has-text('OK')",
+    "button:has-text('Akceptuję')",
+    "button:has-text('Zgadzam się')",
+]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
-
-def _parse_price_text(txt: str) -> float:
-    """
-    '1 234,56 zł' -> 1234.56
-    '1234.56'    -> 1234.56
-    """
-    if not txt:
-        raise ValueError("Brak tekstu ceny")
-    t = txt.strip().lower()
-    t = t.replace("zł", "").replace(" ", "").replace("\xa0", "").replace(",", ".")
-    # wyciągnij pierwszą liczbę (na wszelki wypadek)
-    m = re.search(r"(\d+(\.\d+)?)", t)
+def _norm_price(text: str) -> Optional[float]:
+    if not text:
+        return None
+    t = text.strip().replace("\u00a0", " ").lower()
+    m = re.search(r"(\d[\d\s]*[,\.]?\d*)", t)
     if not m:
-        raise ValueError(f"Nie rozpoznano formatu ceny: {txt!r}")
-    return float(m.group(1))
+        return None
+    num = m.group(1).replace(" ", "").replace(",", ".")
+    try:
+        return float(num)
+    except ValueError:
+        return None
 
-
-def _price_from_json_ld(html: str) -> Optional[float]:
-    """
-    Allegro zwykle osadza JSON-LD ze strukturą:
-    {"@type":"Product", ... "offers":{"@type":"Offer","price":"123.45"}}
-    """
-    for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
-                         html, flags=re.S | re.I):
+def _extract_meta(page) -> Optional[float]:
+    for sel in ["meta[property='product:price:amount']",
+                "meta[property='og:price:amount']"]:
         try:
-            data = json.loads(m.group(1))
+            content = page.locator(sel).first.get_attribute("content", timeout=800)
+            if content:
+                v = _norm_price(content)
+                if v is not None:
+                    return v
+        except Exception:
+            pass
+    return None
+
+def _accept_cookies(page):
+    for sel in COOKIE_BUTTONS:
+        try:
+            page.locator(sel).first.click(timeout=1500)
+            return
         except Exception:
             continue
 
-        # czasem to lista kilku obiektów
-        candidates = data if isinstance(data, list) else [data]
-        for node in candidates:
-            # product -> offers -> price
-            offers = None
-            if isinstance(node, dict):
-                if node.get("@type") == "Product":
-                    offers = node.get("offers")
-                elif "offers" in node:
-                    offers = node["offers"]
-            if isinstance(offers, dict) and "price" in offers:
-                return float(str(offers["price"]).replace(",", "."))
-    return None
-
-
-def _price_from_dom(html: str) -> Optional[float]:
-    """
-    Fallback: szukamy w drzewie DOM.
-    Najpierw Allegro-owy znacznik testowy, potem regex.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Dość stabilny selektor na Allegro:
-    el = soup.select_one("span[data-testid='price']") or soup.select_one("div[data-testid='price'] span")
-    if el and el.get_text(strip=True):
-        return _parse_price_text(el.get_text(" ", strip=True))
-
-    # plan B: meta z ceną / regex po 'price":"123.45"'
-    m = re.search(r'"price"\s*:\s*"(\d+(?:\.\d+)?)"', html)
-    if m:
-        return float(m.group(1))
-
-    return None
-
-
-def get_price(auction_id: str) -> float:
-    """
-    Pobiera stronę oferty i wyciąga cenę.
-    """
+def get_price_for(page, auction_id: str) -> Optional[float]:
     url = f"https://allegro.pl/oferta/{auction_id}"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    if resp.status_code != 200:
-        raise RuntimeError(f"HTTP {resp.status_code} dla {url}")
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    _accept_cookies(page)
+    v = _extract_meta(page)
+    if v is not None:
+        return v
+    for sel in PRICE_SEL_CANDIDATES:
+        try:
+            loc = page.locator(sel).first
+            txt = loc.inner_text(timeout=2500)
+            v = _norm_price(txt)
+            if v is not None:
+                return v
+        except PWTimeout:
+            continue
+        except Exception:
+            continue
+    try:
+        body_text = page.inner_text("body", timeout=2500)
+        v = _norm_price(body_text)
+        if v is not None:
+            return v
+    except Exception:
+        pass
+    return None
 
-    html = resp.text
+def get_price_batch(auctions: List[Dict]) -> Tuple[List[Tuple[Dict, Optional[float]]], List[str]]:
+    results: List[Tuple[Dict, Optional[float]]] = []
+    errors: List[str] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        context = browser.new_context(
+            locale="pl-PL",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+        )
+        page = context.new_page()
+        for a in auctions:
+            try:
+                price = get_price_for(page, a["id"])
+                results.append((a, price))
+            except Exception as e:
+                errors.append(f"{a['product']} [{a['id']}]: {e}")
+                results.append((a, None))
+        context.close()
+        browser.close()
+    return results, errors
 
-    # 1) próbujemy JSON-LD (najpewniejsze)
-    price = _price_from_json_ld(html)
-    if price is not None:
-        return price
-
-    # 2) fallback na DOM/regex
-    price = _price_from_dom(html)
-    if price is not None:
-        return price
-
-    raise RuntimeError("Nie udało się znaleźć ceny na stronie")
+def keyword_scan(keyword: str, max_pages: int = 1) -> List[Dict]:
+    out: List[Dict] = []
+    q = quote_plus(keyword)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        context = browser.new_context(
+            locale="pl-PL",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+        )
+        page = context.new_page()
+        for page_no in range(1, max_pages + 1):
+            url = f"https://allegro.pl/listing?string={q}&p={page_no}"
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            _accept_cookies(page)
+            cards = page.locator("article").all()
+            for card in cards:
+                try:
+                    link = card.locator("a[href*='/oferta/']").first
+                    href = link.get_attribute("href", timeout=1500) or ""
+                    title = (link.get_attribute("title") or link.inner_text(timeout=1500) or "").strip()
+                    price_txt = (card.locator("span[data-testid='price']").first.inner_text(timeout=1500)
+                                 if card.locator("span[data-testid='price']").count() > 0 else "")
+                    price = _norm_price(price_txt)
+                    if not title or price is None or "/oferta/" not in href:
+                        continue
+                    m = re.search(r"/oferta/(\d+)", href)
+                    offer_id = m.group(1) if m else None
+                    out.append({
+                        "title": title,
+                        "price": price,
+                        "url": href if href.startswith("http") else ("https://allegro.pl" + href),
+                        "id": offer_id,
+                    })
+                except Exception:
+                    continue
+        context.close()
+        browser.close()
+    return out
