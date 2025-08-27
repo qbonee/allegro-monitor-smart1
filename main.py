@@ -71,15 +71,20 @@ def _chunk(lst: List[Dict], n: int) -> List[List[Dict]]:
 def main():
     print("== Start programu (main.py) ==")
 
-    # załaduj moduł get_price
+    # wymuszamy batch – to jest krytyczne dla szybkości
     try:
         gp = importlib.import_module("get_price")
+        get_price_batch = getattr(gp, "get_price_batch")
     except Exception as e:
-        print(f"[FATAL] Nie mogę zaimportować 'get_price': {e}")
+        print(f"[FATAL] Brak get_price_batch w get_price.py ({e})")
         raise
 
     auctions = load_auctions_from_files(".")
-    print(f"[INFO] Wczytano {len(auctions)} wpisów .txt")
+    total = len(auctions)
+    print(f"[INFO] Wczytano {total} wpisów .txt")
+    if total == 0:
+        print("[INFO] Nic do sprawdzenia.")
+        return
 
     alerts: List[Dict] = []
     errors: List[str] = []
@@ -87,39 +92,32 @@ def main():
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
     SLEEP_BETWEEN_BATCH = float(os.getenv("SLEEP_BETWEEN_BATCH", "0.5"))
 
-    if hasattr(gp, "get_price_batch"):
-        print("[INFO] Tryb BATCH (jedna przeglądarka na wiele aukcji)")
-        for i, chunk in enumerate(_chunk(auctions, BATCH_SIZE), 1):
-            try:
-                results, errs = gp.get_price_batch(chunk)  # type: ignore[attr-defined]
-                # errors
-                if errs:
-                    errors.extend(errs)
-                # results -> sprawdzamy progi
-                by_id = {r["id"]: r for r in results}
-                for a in chunk:
-                    r = by_id.get(a["id"])
-                    if not r:
-                        continue
-                    price = float(r["price"])
-                    if price < a["min_price"]:
-                        alerts.append({"product": a["product"], "id": a["id"], "price": price, "min": float(a["min_price"])})
-            except Exception as e:
-                errors.append(f"[BATCH {i}] Błąd partii: {e}")
-            time.sleep(SLEEP_BETWEEN_BATCH)
+    chunks = _chunk(auctions, BATCH_SIZE)
+    all_batches = len(chunks)
+    print(f"[INFO] Tryb BATCH: {all_batches} partii po maks {BATCH_SIZE} aukcji")
 
-    elif hasattr(gp, "get_price"):
-        print("[INFO] Tryb SINGLE (osobna przeglądarka na aukcję) — wolniej")
-        for a in auctions:
-            try:
-                price = gp.get_price(a["id"])  # type: ignore[attr-defined]
-                if price < a["min_price"]:
-                    alerts.append({"product": a["product"], "id": a["id"], "price": float(price), "min": float(a["min_price"])})
-            except Exception as e:
-                errors.append(f"{a['product']}: Błąd sprawdzania aukcji {a['id']}: {e}")
-            time.sleep(0.6)
-    else:
-        raise ImportError("[FATAL] W 'get_price.py' nie ma ani get_price_batch, ani get_price")
+    processed = 0
+    for i, chunk in enumerate(chunks, 1):
+        t0 = time.time()
+        results, errs = get_price_batch(chunk)  # type: ignore
+        dt = time.time() - t0
+
+        if errs:
+            errors.extend(errs)
+
+        # results -> sprawdzamy progi
+        by_id = {r["id"]: r for r in results}
+        for a in chunk:
+            r = by_id.get(a["id"])
+            if not r:
+                continue
+            price = float(r["price"])
+            if price < a["min_price"]:
+                alerts.append({"product": a["product"], "id": a["id"], "price": price, "min": float(a["min_price"])})
+
+        processed += len(chunk)
+        print(f"[PROGRESS] Batch {i}/{all_batches} OK w {dt:.1f}s — przetworzono {processed}/{total}")
+        time.sleep(SLEEP_BETWEEN_BATCH)
 
     # raport
     if alerts:
