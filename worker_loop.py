@@ -4,7 +4,7 @@ import importlib
 import traceback
 import random
 
-INTERVAL_SEC = int(os.getenv("WORKER_INTERVAL_SEC", "10800"))  # domyślnie 3h
+INTERVAL_SEC = int(os.getenv("WORKER_INTERVAL_SEC", "10800"))  # 3h
 JITTER_SEC = int(os.getenv("WORKER_JITTER_SEC", "15"))
 
 def run_once():
