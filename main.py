@@ -1,17 +1,13 @@
 import os
 import time
-from typing import List, Dict
-
-from get_price import get_price
-from email_alert import send_alert
+import importlib
+from typing import List, Dict, Callable
 
 
 # ===== Helpers ===============================================================
 
 def parse_price(text: str) -> float:
-    """
-    '40zł' / '40 zł' / '40,00' / '40.00' -> 40.0
-    """
+    """'40zł' / '40 zł' / '40,00' -> 40.0"""
     t = (text or "").lower().replace("zł", "").replace(" ", "").replace(",", ".")
     return float(t)
 
@@ -44,7 +40,7 @@ def load_auctions_from_files(folder: str = ".") -> List[Dict]:
 
             product = filename.replace(".txt", "")
 
-            # Format B: ID;MIN w każdej linii
+            # Format B: ID;MIN
             if any(";" in ln for ln in lines):
                 for ln in lines:
                     if ";" not in ln:
@@ -57,7 +53,7 @@ def load_auctions_from_files(folder: str = ".") -> List[Dict]:
                     })
                 continue
 
-            # Format A: pierwszy wiersz = "cena minimalna: XXX"
+            # Format A: nagłówek + ID
             header = lines[0].lower()
             if header.startswith("cena minimalna:"):
                 min_price = parse_price(header.split(":", 1)[1])
@@ -71,7 +67,7 @@ def load_auctions_from_files(folder: str = ".") -> List[Dict]:
         except Exception as e:
             print(f"[WARN] Nie udało się wczytać pliku {filename}: {e}")
 
-    # de-duplikacja (na wszelki wypadek: klucz = (product, id))
+    # de-duplikacja
     seen = set()
     uniq: List[Dict] = []
     for a in auctions:
@@ -84,21 +80,64 @@ def load_auctions_from_files(folder: str = ".") -> List[Dict]:
     return uniq
 
 
+def _resolve_get_price() -> Callable[[str], float]:
+    """
+    Bezpiecznie ładujemy moduł get_price.
+    - Jeśli jest funkcja get_price(auction_id) -> float, używamy jej.
+    - Jeśli jest tylko get_price_batch(auctions) -> (results, errors),
+      tworzymy lekki adapter.
+    """
+    try:
+        mod = importlib.import_module("get_price")
+    except Exception as e:
+        raise ImportError(f"[FATAL] Nie mogę zaimportować modułu 'get_price': {e}") from e
+
+    if hasattr(mod, "get_price") and callable(getattr(mod, "get_price")):
+        print("[INFO] Używam get_price.get_price()")
+        return getattr(mod, "get_price")
+
+    if hasattr(mod, "get_price_batch") and callable(getattr(mod, "get_price_batch")):
+        print("[INFO] Używam adaptera do get_price.get_price_batch()")
+
+        def _adapter(auction_id: str) -> float:
+            # Tworzymy minimalny obiekt aukcji
+            auctions = [{"id": auction_id, "min_price": 0.0, "product": ""}]
+            results, errs = mod.get_price_batch(auctions)  # type: ignore[attr-defined]
+            if errs:
+                # jeśli batch zwróci błąd dla jednej aukcji – sygnalizujemy wyjątek
+                raise RuntimeError(errs[0])
+            # zakładamy results[0]["price"]
+            return float(results[0]["price"])
+
+        return _adapter
+
+    raise ImportError(
+        "[FATAL] W 'get_price.py' nie znaleziono ani funkcji 'get_price', ani 'get_price_batch'. "
+        "Upewnij się, że plik /app/get_price.py je definiuje i nie ma importów kołowych."
+    )
+
+
 # ===== Main ==================================================================
 
 def main():
-    print("== Start programu ==")
+    print("== Start programu (main.py) ==")
+
+    # leniwe i odporne ładowanie get_price
+    try:
+        get_price = _resolve_get_price()
+    except Exception as e:
+        print(str(e))
+        raise
 
     auctions = load_auctions_from_files(".")
     print(f"[INFO] Wczytano {len(auctions)} wpisów .txt")
 
-    alerts: List[Dict] = []   # tylko realne zaniżenia cen
-    errors: List[str] = []    # komunikaty błędów do logów
+    alerts: List[Dict] = []
+    errors: List[str] = []
 
     for idx, a in enumerate(auctions, 1):
         try:
             price = get_price(a["id"])
-            # Debug (jak chcesz): print(f"[DBG] {a['product']} ({a['id']}): {price:.2f} vs {a['min_price']:.2f}")
             if price < a["min_price"]:
                 alerts.append({
                     "product": a["product"],
@@ -109,11 +148,12 @@ def main():
         except Exception as e:
             errors.append(f"{a['product']}: Błąd sprawdzania aukcji {a['id']}: {e}")
 
-        # throttling, żeby nie dusić Allegro
-        time.sleep(0.6)
+        time.sleep(0.6)  # throttling
 
     if alerts:
         print(f"[INFO] Znaleziono {len(alerts)} zaniżonych aukcji – wysyłam e-mail…")
+        # import lokalny, żeby uniknąć potencjalnych cykli importu na starcie
+        from email_alert import send_alert
         send_alert(alerts)
     else:
         print("[INFO] Brak zaniżonych cen.")
@@ -125,5 +165,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # umożliwia lokalne odpalenie: `python main.py`
     main()
