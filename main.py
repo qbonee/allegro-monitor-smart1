@@ -6,7 +6,9 @@ from datetime import datetime, timedelta
 from typing import List, Dict
 
 ENDED_CACHE_PATH = os.getenv("ENDED_CACHE_PATH", "ended_cache.json")
-RECHECK_ENDED_HOURS = int(os.getenv("RECHECK_ENDED_HOURS", "72"))  # po ilu godzinach ponownie sprawdzać
+RECHECK_ENDED_HOURS = int(os.getenv("RECHECK_ENDED_HOURS", "72"))  # po ilu godzinach znów sprawdzać
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
+SLEEP_BETWEEN_BATCH = float(os.getenv("SLEEP_BETWEEN_BATCH", "0.5"))
 
 # ===== Helpers ===============================================================
 
@@ -41,13 +43,12 @@ def load_auctions_from_files(folder: str = ".") -> List[Dict]:
         except Exception as e:
             print(f"[WARN] Nie udało się wczytać pliku {filename}: {e}")
 
-    # de-duplikacja (po parze produkt+id; ustaw GLOBAL_DEDUP=1 aby deduplikować po samym id)
-    global_dedup = os.getenv("GLOBAL_DEDUP", "0") == "1"
+    # de-duplikacja
     seen = set()
     uniq: List[Dict] = []
     for a in auctions:
-        key = a["id"] if global_dedup else (a["product"], a["id"])
-        if key in seen:
+        key = (a["product"], a["id"])
+        if key in seen:  # zostaw pierwszy
             continue
         seen.add(key)
         uniq.append(a)
@@ -62,7 +63,6 @@ def _now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 def _parse_iso(s: str) -> datetime:
-    # prosty parser ISO z 'Z'
     return datetime.fromisoformat(s.replace("Z", ""))
 
 def load_ended_cache(path: str = ENDED_CACHE_PATH) -> Dict[str, str]:
@@ -97,14 +97,10 @@ def mark_ended(auction_id: str, cache: Dict[str, str]) -> None:
 def main():
     print("== Start programu (main.py) ==")
 
-    # załaduj moduł get_price
-    try:
-        gp = importlib.import_module("get_price")
-        get_price_batch = getattr(gp, "get_price_batch")
-        EndedOfferError = getattr(gp, "EndedOfferError", RuntimeError)  # fallback: jakby ktoś usunął klasę
-    except Exception as e:
-        print(f"[FATAL] Nie mogę zaimportować 'get_price': {e}")
-        raise
+    # get_price (batch) + typ wyjątku zakończenia
+    gp = importlib.import_module("get_price")
+    get_price_batch = getattr(gp, "get_price_batch")
+    EndedOfferError = getattr(gp, "EndedOfferError", RuntimeError)
 
     auctions = load_auctions_from_files(".")
     total = len(auctions)
@@ -113,7 +109,7 @@ def main():
         print("[INFO] Nic do sprawdzenia.")
         return
 
-    # załaduj cache zakończonych i odfiltruj „świeżo zakończone”
+    # cache zakończonych
     ended_cache = load_ended_cache()
     to_check: List[Dict] = []
     skipped_ended = 0
@@ -128,9 +124,6 @@ def main():
     alerts: List[Dict] = []
     errors: List[str] = []
 
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
-    SLEEP_BETWEEN_BATCH = float(os.getenv("SLEEP_BETWEEN_BATCH", "0.5"))
-
     chunks = _chunk(to_check, BATCH_SIZE)
     all_batches = len(chunks)
     print(f"[INFO] Tryb BATCH: {all_batches} partii po maks {BATCH_SIZE} aukcji")
@@ -141,27 +134,24 @@ def main():
         results, errs = get_price_batch(chunk)  # type: ignore
         dt = time.time() - t0
 
-        # przetwórz błędy (miękko traktuj zakończone)
-        for e in errs or []:
-            msg = str(e)
-            # jeśli get_price_batch pakowało już stringi, a nie wyjątki, sprawdzamy frazy
-            if "ENDED" in msg or "zakończon" in msg or "usunięt" in msg:
-                # spróbuj wyciągnąć ID z wiadomości (ostatnie cyfry)
-                # a jak się nie uda – oznacz wszystkie z chunku
+        # błędy – miękko oznacz zakończone (szukamy fraz ENDED/zakończon/usunięt)
+        for msg in errs or []:
+            s = str(msg)
+            if ("ENDED" in s) or ("zakończon" in s) or ("usunięt" in s) or ("HTTP 404" in s) or ("HTTP 410" in s):
+                # spróbuj wyłuskać ID; jeśli nie, oznaczamy cały chunk (bezpiecznie i rzadko)
                 found = False
                 for a in chunk:
-                    if a["id"] in msg:
+                    if a["id"] in s:
                         mark_ended(a["id"], ended_cache)
                         found = True
                         break
                 if not found:
                     for a in chunk:
                         mark_ended(a["id"], ended_cache)
-                print("[INFO] Pomijam zakończoną/usuniętą ofertę ->", msg)
             else:
-                errors.append(msg)
+                errors.append(s)
 
-        # results -> sprawdzamy progi
+        # sprawdź progi
         by_id = {r["id"]: r for r in results}
         for a in chunk:
             r = by_id.get(a["id"])
@@ -175,7 +165,7 @@ def main():
         print(f"[PROGRESS] Batch {i}/{all_batches} OK w {dt:.1f}s — przetworzono {processed}/{len(to_check)}")
         time.sleep(SLEEP_BETWEEN_BATCH)
 
-    # zapisz cache (żeby przy kolejnym uruchomieniu nie męczyć świeżo zakończonych)
+    # zapisz cache zakończonych
     save_ended_cache(ended_cache)
 
     # raport
