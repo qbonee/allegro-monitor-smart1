@@ -1,12 +1,16 @@
 # get_price.py
-# Kompatybilne z Playwright 1.54.0 (python)
-# Zwraca: (results, errors) dla get_price_batch oraz float dla get_price
+# Playwright 1.54.x — pobieranie ceny pojedynczej oferty Allegro po ID.
+# Eksportuje:
+#   - get_price(auction_id) -> float
+#   - get_price_batch(auctions: List[dict]) -> (results: List[dict], errors: List[str])
+#
+# Wynik batcha: results = [{"id": "...", "price": 123.45, "product": "..."}]
 
-from typing import List, Tuple, Any
+from typing import List, Tuple
 import re
-
 from playwright.sync_api import sync_playwright, Page
 
+# ------------------ utils ------------------
 
 def _parse_price_str(s: str) -> float:
     """
@@ -15,31 +19,18 @@ def _parse_price_str(s: str) -> float:
     '1234,56'  -> 1234.56
     """
     s = (s or "").strip()
-    # usuń spacje tysięcy
     s = s.replace("\xa0", " ").replace(" ", "")
-    # zamień przecinek na kropkę
     s = s.replace(",", ".")
-    # wyciągnij pierwszą liczbę
     m = re.search(r"(\d+(?:\.\d+)?)", s)
     if not m:
         raise ValueError(f"Nie znaleziono liczby w '{s}'")
     return float(m.group(1))
 
-
-def get_price_single_with_page(page: Page, auction_id: str) -> float:
-    """
-    Pobiera cenę dla pojedynczej aukcji używając już otwartej strony.
-    Zwraca float (cena) lub rzuca wyjątek z opisem problemu.
-    """
-    # Najczęstszy format URL na Allegro:
-    # - https://allegro.pl/oferta/<AUCTION_ID>
-    # Jeśli masz inny format w swoich danych – zmień poniższą linię.
+def _extract_price_from_page(page: Page, auction_id: str) -> float:
     url = f"https://allegro.pl/oferta/{auction_id}"
-
-    # przejście na stronę
     page.goto(url, wait_until="domcontentloaded", timeout=45_000)
 
-    # 1) meta[itemprop="price"] – często obecne
+    # 1) meta[itemprop=price]
     try:
         meta = page.locator("meta[itemprop='price']")
         if meta.count() > 0:
@@ -49,7 +40,7 @@ def get_price_single_with_page(page: Page, auction_id: str) -> float:
     except Exception:
         pass
 
-    # 2) Popularne testID-y Allegro (różnie bywa)
+    # 2) popularne selektory "price"
     candidates = [
         "[data-testid='price-value']",
         "[data-testid='price-primary']",
@@ -65,17 +56,15 @@ def get_price_single_with_page(page: Page, auction_id: str) -> float:
                 if txt and re.search(r"\d", txt):
                     return _parse_price_str(txt)
         except Exception:
-            # próbujemy kolejne selektory
             pass
 
-    # 3) Ostateczny fallback: parsuj HTML (czasem w JSON-ie)
+    # 3) fallback: HTML/JSON
     try:
         html = page.content()
-        # przykładowe wzorce; możesz dodać kolejne, jeśli zauważysz inne struktury
         patterns = [
             r'"price"\s*:\s*{"amount"\s*:\s*"([\d.,\s]+)"',
-            r'"amount"\s*:\s*"([\d.,\s]+)"\s*,\s*"currency"',  # inny JSON
-            r'content="([\d.,\s]+)"\s+itemprop="price"',        # meta
+            r'"amount"\s*:\s*"([\d.,\s]+)"\s*,\s*"currency"',
+            r'content="([\d.,\s]+)"\s+itemprop="price"',
         ]
         for pat in patterns:
             m = re.search(pat, html)
@@ -86,45 +75,36 @@ def get_price_single_with_page(page: Page, auction_id: str) -> float:
 
     raise RuntimeError(f"Nie udało się znaleźć ceny na stronie {url}")
 
+# ------------------ API: single ------------------
 
 def get_price(auction_id: str) -> float:
-    """
-    Wariant jednorazowy – otwiera przeglądarkę, pobiera cenę i zamyka.
-    Używany sporadycznie; produkcyjnie lepszy jest get_price_batch.
-    """
+    if not auction_id or not str(auction_id).strip().isdigit():
+        raise ValueError(f"Niepoprawne ID aukcji: {auction_id!r}")
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = browser.new_context()
         page = ctx.new_page()
         try:
-            price = get_price_single_with_page(page, auction_id)
-            return price
+            return _extract_price_from_page(page, str(auction_id).strip())
         finally:
             ctx.close()
             browser.close()
 
+# ------------------ API: batch ------------------
 
-def get_price_batch(auctions: List[dict]) -> Tuple[List[Tuple[Any, float, bool]], List[str]]:
+def get_price_batch(auctions: List[dict]) -> Tuple[List[dict], List[str]]:
     """
-    Batchowy pobór cen.
-    Parametr `auctions` – lista słowników w formacie:
-        {"id": "<AUCTION_ID>", "min_price": <float>, "product": "<nazwa>"}
-
+    auctions: [{"id": "<ID>", "product": "<nazwa>", "min_price": <float>}, ...]
     Zwraca:
-        results: lista tupli (auction_dict, price_float, ok_bool)
-        errors:  lista napisów z opisem błędu
+      results: [{"id":"...", "price": 123.45, "product":"..."}]
+      errors:  ["opis błędu", ...]
     """
-    results: List[Tuple[Any, float, bool]] = []
+    results: List[dict] = []
     errors: List[str] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = browser.new_context()
         page = ctx.new_page()
 
@@ -133,12 +113,10 @@ def get_price_batch(auctions: List[dict]) -> Tuple[List[Tuple[Any, float, bool]]
                 aid = str(a.get("id", "")).strip()
                 product = a.get("product", "")
                 try:
-                    price = get_price_single_with_page(page, aid)
-                    results.append((a, price, True))
+                    price = _extract_price_from_page(page, aid)
+                    results.append({"id": aid, "price": float(price), "product": product})
                 except Exception as e:
-                    msg = f"{product}: Błąd sprawdzania aukcji {aid}: {e}"
-                    errors.append(msg)
-                    results.append((a, 0.0, False))
+                    errors.append(f"{product}: Błąd sprawdzania aukcji {aid}: {e}")
         finally:
             ctx.close()
             browser.close()
