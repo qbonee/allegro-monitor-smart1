@@ -1,388 +1,217 @@
-# get_price.py
-from __future__ import annotations
+# -*- coding: utf-8 -*-
+"""
+Allegro price watcher dla cron workera.
 
-import json
-import os
-import re
-import time
-from typing import Dict, List, Tuple, Optional
+Format plików wejściowych (*.txt):
+  1. linia:  'cena minimalna: 40zł'   (wartość progu w PLN)
+  2..n linie: ID oferty Allegro (lub pełny URL https://allegro.pl/oferta/ID)
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+Domyślnie skrypt sprawdza wszystkie *.txt w katalogu repo.
+Aby ograniczyć do jednego pliku (np. do testów): ustaw ENV TARGET_FILE_BASENAME="Akwesan Starter"
 
-ALLEGRO_URL = "https://allegro.pl/oferta/{aid}"
-DEBUG = os.getenv("DEBUG_PRICE", "0") == "1"
+Skrypt nie omija CAPTCHA — używa pojedynczych, rzadkich żądań HTTP.
+Ma wbudowane: jitter, limit na przebieg, backoff na 403/429 i detekcję podejrzenia CAPTCHA.
 
-# ------------------------------- utils ------------------------------------- #
+Wymagane ENV (SMTP):
+  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_TO
+Opcjonalne ENV:
+  MAIL_FROM, MAIL_FROM_NAME, EMAIL_SUBJECT, EMAIL_HTML,
+  TARGET_FILE_BASENAME="Akwesan Starter",
+  BASE_DELAY=0.8, JITTER=0.8, MAX_PER_RUN=0,
+  BACKOFF_START=5, BACKOFF_MAX=900,
+  STATE_PATH=/data/state.json
+"""
 
-class EndedOfferError(RuntimeError):
-    """Aukcja zakończona/usunięta (HTTP 404/410 lub podobny sygnał)."""
+import os, re, json, time, ssl, smtplib, pathlib, random
+from email.mime.text import MIMEText
+from typing import Optional, Dict, Any, Iterator, Tuple, Iterable
+import requests
 
+# ---- grzeczne tempo / limity ----
+BASE_DELAY = float(os.environ.get("BASE_DELAY", "0.8"))      # bazowa pauza między żądaniami
+JITTER     = float(os.environ.get("JITTER", "0.8"))          # losowy dodatek/odjęcie (0..JITTER)
+MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "0"))        # ile ID maks. na jeden przebieg; 0=bez limitu
+BACKOFF_START = float(os.environ.get("BACKOFF_START", "5"))  # przy 403/429/captcha
+BACKOFF_MAX   = float(os.environ.get("BACKOFF_MAX", "900"))
 
-def _parse_price_text(txt: str) -> Optional[float]:
-    if not txt:
-        return None
-    t = (
-        txt.lower()
-        .replace("zł", "")
-        .replace("pln", "")
-        .replace("\u00a0", " ")
-    )
-    t = re.sub(r"[^\d,.\s]", "", t).strip()
-    m = re.search(r"(\d[\d\s]*[.,]\d{1,2}|\d[\d\s]*)", t)
-    if not m:
-        return None
-    num = m.group(1).replace(" ", "").replace(",", ".")
-    try:
-        return float(num)
-    except Exception:
-        return None
+# ---- pliki / ścieżki ----
+ROOT = pathlib.Path(__file__).parent.resolve()
+STATE_PATH = pathlib.Path(os.environ.get("STATE_PATH", str(ROOT / "state.json")))
+TARGET_FILE = os.environ.get("TARGET_FILE_BASENAME")  # np. "Akwesan Starter" (bez .txt)
 
+# ---- HTTP ----
+UA   = "Mozilla/5.0 (compatible; AllegroWatcher/1.4; cron-worker)"
+HDRS = {"User-Agent": UA, "Accept-Language": "pl-PL,pl;q=0.9"}
+session = requests.Session()
 
-def _json_find_price(obj) -> Optional[float]:
-    """Przejdź po dowolnym dict/list i wyciągnij pierwszą sensowną cenę."""
-    try:
-        if obj is None:
-            return None
-        if isinstance(obj, (int, float)):
-            return float(obj) if obj > 0.01 else None
-        if isinstance(obj, str):
-            return _parse_price_text(obj)
-        if isinstance(obj, dict):
-            for k in ("price", "amount", "currentPrice", "sellingMode", "buyNowPrice", "minPrice", "value"):
-                if k in obj:
-                    v = obj[k]
-                    if isinstance(v, dict):
-                        for kk in ("amount", "price", "value"):
-                            if kk in v:
-                                pv = _json_find_price(v[kk])
-                                if pv is not None:
-                                    return pv
-                    else:
-                        pv = _json_find_price(v)
-                        if pv is not None:
-                            return pv
-            for v in obj.values():
-                pv = _json_find_price(v)
-                if pv is not None:
-                    return pv
-        if isinstance(obj, list):
-            for v in obj:
-                pv = _json_find_price(v)
-                if pv is not None:
-                    return pv
-    except Exception:
-        return None
-    return None
+# ---- regexy ----
+RE_ID      = re.compile(r"(?:/oferta/)?(?P<id>\d{8,})")
+RE_HEADER  = re.compile(r"cena\s*minimalna\s*:\s*([0-9][0-9 .,\t]*[0-9])\s*z?ł?", re.I)
+RE_PLN     = re.compile(r"(\d{1,3}(?:[ .]\d{3})*(?:[.,]\d{2}))\s*zł", re.I)
+RE_JSONLD  = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S | re.I)
+RE_CAPTCHA = re.compile(r"captcha|nie\s*jesteś\s*robotem|przepraszamy.*zabezpieczenie", re.I)
 
+class CaptchaSuspected(Exception):
+    pass
 
-def _extract_price_from_html(html: str) -> Optional[float]:
-    pats = [
-        r'"price"\s*:\s*"(?P<p>[\d.,\s]+)"',
-        r'"price"\s*:\s*(?P<p>\d[\d.,\s]*)',
-        r'"currentPrice"\s*:\s*\{[^}]*"amount"\s*:\s*"(?P<p>[\d.,]+)"',
-        r'"amount"\s*:\s*"(?P<p>[\d.,]+)"\s*,\s*"currency"\s*:\s*"(?:PLN|zł)"',
-        r'"buyNowPrice"\s*:\s*\{[^}]*"amount"\s*:\s*"(?P<p>[\d.,]+)"',
-    ]
-    for pat in pats:
-        m = re.search(pat, html)
-        if m:
-            v = _parse_price_text(m.group("p"))
-            if v is not None:
-                return v
-    return None
+def pl_to_float(s: str) -> float:
+    s = s.strip().replace("\xa0", " ").replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    return float(s)
 
-
-def _dbg(page, msg: str) -> None:
-    if not DEBUG:
-        return
-    try:
-        url = page.url
-    except Exception:
-        url = "(no url)"
-    print(f"[DEBUG] {msg} | URL={url}")
-
-
-def _click_consent_everywhere(page) -> None:
-    """Kliknij zgody zarówno w głównej stronie jak i w iframach."""
-    def try_click(p):
+def load_state() -> Dict[str, Any]:
+    if STATE_PATH.exists():
         try:
-            texts = [
-                r"Zgadzam się", r"Akceptuj", r"Akceptuję", r"Przejdź dalej",
-                r"OK", r"Rozumiem", r"Zaakceptuj wszystko", r"Przejdź do serwisu",
-                r"Accept all", r"Agree", r"I accept",
-            ]
-            for t in texts:
-                b = p.get_by_role("button", name=re.compile(t, re.I))
-                if b.count() > 0:
-                    b.first.click(timeout=1200)
-                    return True
-            loc = p.locator("text=/Zgadzam|Akceptuj|Przejdź dalej|Rozumiem|Accept/i").first
-            if loc.count() > 0:
-                loc.click(timeout=1200)
-                return True
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
-            return False
-        return False
+            pass
+    return {"alerts": {}}  # offer_id -> {"price": float, "ts": int}
 
-    clicked = try_click(page)
-    if clicked:
-        _dbg(page, "Kliknięto zgodę w głównej stronie")
-        time.sleep(0.3)
+def save_state(state: Dict[str, Any]) -> None:
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def find_txt_files() -> Iterable[pathlib.Path]:
+    files = sorted(ROOT.glob("*.txt"))
+    if TARGET_FILE:
+        target_lower = TARGET_FILE.lower()
+        for p in files:
+            if p.stem.lower() == target_lower or p.name.lower() == f"{target_lower}.txt":
+                return [p]
+        raise FileNotFoundError(f"Nie znalazłem pliku '{TARGET_FILE}' w {ROOT}")
+    return files
+
+def read_threshold(path: pathlib.Path) -> float:
+    txt = path.read_text(encoding="utf-8", errors="ignore")
+    m = RE_HEADER.search(txt)
+    if not m:
+        raise ValueError(f"[{path.name}] Brak nagłówka 'cena minimalna: ...'")
+    return pl_to_float(m.group(1))
+
+def iter_ids_from_file(path: pathlib.Path) -> Iterator[Tuple[str, int]]:
+    seen = set()
+    for i, raw in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#") or RE_HEADER.search(line):
+            continue
+        m = RE_ID.search(line)
+        if not m:
+            continue
+        offer_id = m.group("id")
+        if offer_id in seen:
+            continue
+        seen.add(offer_id)
+        yield offer_id, i
+
+def polite_sleep():
+    delay = BASE_DELAY + random.uniform(0, JITTER if JITTER > 0 else 0)
+    if delay > 0:
+        time.sleep(delay)
+
+def fetch_html(url: str) -> str:
     try:
-        for fr in page.frames:
-            if fr is page.main_frame:
-                continue
-            if try_click(fr):
-                _dbg(page, "Kliknięto zgodę w iframie")
-                time.sleep(0.3)
-                break
-    except Exception:
-        pass
+        r = session.get(url, headers=HDRS, timeout=30)
+    except requests.RequestException as e:
+        raise RuntimeError(f"HTTP request failed: {e}")
+    if r.status_code in (403, 429):
+        raise CaptchaSuspected(f"HTTP {r.status_code}")
+    text = r.text
+    if RE_CAPTCHA.search(text):
+        raise CaptchaSuspected("captcha suspected in body")
+    r.raise_for_status()
+    return text
 
-
-def _wait_price_visible(page, timeout_ms: int = 9000) -> None:
-    sels = [
-        '[data-testid="uc-price"]',
-        '[data-testid="price-primary"]',
-        '[data-testid="price"]',
-        '[data-testid="price-value"]',
-        '[itemprop="price"]',
-        'meta[itemprop="price"]',
-        'span[class*="price"]',
-    ]
-    end = time.time() + timeout_ms / 1000.0
-    while time.time() < end:
-        for s in sels:
-            try:
-                if s.startswith("meta"):
-                    loc = page.locator(s).first
-                    if loc.count() and _parse_price_text(loc.get_attribute("content") or "") is not None:
-                        return
-                else:
-                    page.wait_for_selector(s, timeout=400, state="attached")
-                    txt = (page.locator(s).first.inner_text(timeout=400) or "").strip()
-                    if _parse_price_text(txt) is not None:
-                        return
-            except Exception:
-                pass
-        time.sleep(0.12)
-
-
-def _extract_price_dom(page) -> Optional[float]:
-    candidates = [
-        '[itemprop="price"]',
-        '[data-testid="uc-price"]',
-        '[data-testid="price"]',
-        '[data-testid="price-value"]',
-        '[data-testid="price-primary"]',
-        'div[data-testid="price-section"]',
-        'div[data-testid="price-wrapper"]',
-        'meta[itemprop="price"]',
-        'span[class*="price"]',
-        '[aria-label*="zł"]',
-    ]
-    for sel in candidates:
+def price_from_jsonld(html: str) -> Optional[float]:
+    for m in RE_JSONLD.finditer(html):
+        block = m.group(1)
         try:
-            loc = page.locator(sel).first
-            if not loc or loc.count() == 0:
-                continue
-            txt = ""
-            try:
-                txt = (loc.inner_text(timeout=600) or "").strip()
-            except Exception:
-                pass
-            v = _parse_price_text(txt)
-            if v is not None:
-                return v
-            content = (loc.get_attribute("content") or "").strip()
-            v = _parse_price_text(content)
-            if v is not None:
-                return v
-            aria = (loc.get_attribute("aria-label") or "").strip()
-            v = _parse_price_text(aria)
-            if v is not None:
-                return v
+            data = json.loads(block)
         except Exception:
             continue
-
-    try:
-        html = page.content()
-        v = _extract_price_from_html(html)
-        if v is not None:
-            return v
-    except Exception:
-        pass
-
-    try:
-        body_txt = page.inner_text("body", timeout=800)
-        m = re.search(r"(\d[\d\s]*[.,]\d{1,2})\s*zł", body_txt.lower())
-        if m:
-            v = _parse_price_text(m.group(1))
-            if v is not None:
-                return v
-    except Exception:
-        pass
-
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                if node.get("@type") in ("Offer","AggregateOffer"):
+                    v = node.get("price") or node.get("lowPrice") or node.get("highPrice")
+                    if v is not None:
+                        try:
+                            return pl_to_float(str(v))
+                        except Exception:
+                            pass
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
     return None
 
-
-def _extract_price_via_js_state(page) -> Optional[float]:
-    """Wyciągnij cenę z obiektów JS osadzonych na stronie."""
+def price_from_text(html: str) -> Optional[float]:
+    matches = RE_PLN.findall(html)
+    if not matches:
+        return None
     try:
-        js = """
-        () => {
-          const out = [];
-          const pick = (w, keys) => { for (const k of keys) if (w && w[k]) return w[k]; return null; };
-          const cand = [
-            pick(window, ["__APP_STATE__", "__INITIAL_STATE__", "__NEXT_DATA__", "__STATE__"])
-          ];
-          // wszystkie <script> z JSON
-          for (const s of Array.from(document.querySelectorAll("script"))) {
-            try {
-              const t = s.textContent || "";
-              if (t.trim().startsWith("{") || t.trim().startsWith("[")) {
-                out.push(JSON.parse(t));
-              }
-            } catch(e) {}
-          }
-          const st = pick(window, ["__APP_STATE__", "__INITIAL_STATE__", "__NEXT_DATA__", "__STATE__"]);
-          if (st) out.unshift(st);
-          return out;
-        }
-        """
-        states = page.evaluate(js)
-        if not isinstance(states, list):
-            states = [states]
-        for st in states:
-            v = _json_find_price(st)
-            if v is not None:
-                return v
+        vals = [pl_to_float(m) for m in matches]
+        return min(vals) if vals else None
     except Exception:
         return None
-    return None
 
-
-def _diagnose(page):
-    if not DEBUG:
-        return
-    try:
-        sels = [
-            '[data-testid="uc-price"]',
-            '[data-testid="price-primary"]',
-            '[data-testid="price"]',
-            '[data-testid="price-value"]',
-            '[itemprop="price"]',
-            'meta[itemprop="price"]',
-            'span[class*="price"]',
-        ]
-        for s in sels:
-            try:
-                c = page.locator(s).count()
-                txt = ""
-                if c:
-                    try:
-                        txt = page.locator(s).first.inner_text(timeout=400)
-                    except Exception:
-                        pass
-                print(f"[DEBUG] sel={s} count={c} text='{txt[:120]}'")
-            except Exception:
-                pass
-        html = page.content()
-        print("[DEBUG] HTML head:", html[:3000].replace("\n", " ")[:3000])
-    except Exception:
-        pass
-
-
-def _get_single(page, auction: Dict) -> Dict:
-    aid = str(auction["id"]).strip()
-    url = ALLEGRO_URL.format(aid=aid)
-
-    # wejście
-    resp = None
-    try:
-        resp = page.goto(url, timeout=60000, wait_until="networkidle")
-    except PWTimeoutError:
-        resp = page.goto(url, timeout=30000, wait_until="domcontentloaded")
-
-    status = None
-    try:
-        status = resp.status if resp else None
-    except Exception:
-        status = None
-
-    if status in (404, 410):
-        raise EndedOfferError(f"ENDED {aid} HTTP {status}")
-
-    _click_consent_everywhere(page)
-    time.sleep(0.35)  # hydracja
-
-    # delikatny scroll — Allegro często dosyła treść po pierwszym ruchu
-    try:
-        page.evaluate("()=>window.scrollBy(0, 300)")
-    except Exception:
-        pass
-    time.sleep(0.2)
-
-    try:
-        _wait_price_visible(page, timeout_ms=9000)
-    except Exception:
-        pass
-
-    # najpierw stany JS, potem DOM/HTML
-    price = _extract_price_via_js_state(page)
-    if price is None:
-        price = _extract_price_dom(page)
-
-    if price is None:
-        _diagnose(page)
-        raise RuntimeError(f"Playwright: brak ceny dla {url}")
-
-    return {"id": aid, "price": float(price)}
-
-
-# ----------------------------- public API ---------------------------------- #
-
-def get_price_batch(auctions: List[Dict]) -> Tuple[List[Dict], List[str]]:
-    results: List[Dict] = []
-    errors: List[str] = []
-    if not auctions:
-        return results, errors
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-                " AppleWebKit/537.36 (KHTML, like Gecko)"
-                " Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="pl-PL",
-            timezone_id="Europe/Warsaw",
-            extra_http_headers={"Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8"},
-        )
-        page = context.new_page()
-
-        for a in auctions:
-            aid = str(a.get("id", "?"))
-            product = str(a.get("product", "")) or "?"
-            try:
-                r = _get_single(page, a)
-                results.append(r)
-            except EndedOfferError as e:
-                errors.append(f"{product}: Aukcja zakończona {aid} ({e})")
-            except PWTimeoutError:
-                errors.append(
-                    f"{product}: Page.goto: Timeout 30000ms exceeded.\n"
-                    f"Call log:\n  - navigating to \"{ALLEGRO_URL.format(aid=aid)}\", waiting until \"domcontentloaded\""
-                )
-            except Exception as e:
-                errors.append(f"{product}: {e}")
-
+def get_offer_price(offer_id: str) -> Optional[float]:
+    url = f"https://allegro.pl/oferta/{offer_id}"
+    backoff = BACKOFF_START
+    while True:
         try:
-            context.close()
-        finally:
-            browser.close()
+            html = fetch_html(url)
+            return price_from_jsonld(html) or price_from_text(html)
+        except CaptchaSuspected as e:
+            print(f"[{offer_id}] Podejrzenie CAPTCHA/limitów: {e} → backoff {backoff:.0f}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, BACKOFF_MAX)
+        except Exception as e:
+            print(f"[{offer_id}] Błąd pobierania: {e}")
+            return None
 
-    return results, errors
+def send_email(to_addr: str, subject: str, html: str) -> None:
+    host = os.environ.get("SMTP_HOST")
+    port = int(os.environ.get("SMTP_PORT", "465"))
+    user = os.environ.get("SMTP_USER")
+    pwd  = os.environ.get("SMTP_PASS")
+    from_addr  = os.environ.get("MAIL_FROM", user)
+    from_name  = os.environ.get("MAIL_FROM_NAME", "Allegro Price Watcher")
+
+    if not all([host, port, user, pwd, from_addr, to_addr]):
+        raise RuntimeError("Brak wymaganych zmiennych SMTP_* lub EMAIL_TO.")
+
+    msg = MIMEText(html, "html", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = f"{from_name} <{from_addr}>"
+    msg["To"] = to_addr
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as s:
+        s.login(user, pwd)
+        s.sendmail(from_addr, [to_addr], msg.as_string())
+
+def process_one_file(path: pathlib.Path, state: Dict[str, Any],
+                     email_to: str, subject_tmpl: str, body_tmpl: str,
+                     remaining_quota: int) -> int:
+    """Zwraca ile ID jeszcze możesz przerobić po tym pliku (quota)."""
+    try:
+        threshold = read_threshold(path)
+    except Exception as e:
+        print(str(e))
+        return remaining_quota
+
+    alerts = state.setdefault("alerts", {})
+    processed = 0
+
+    for offer_id, line_no in iter_ids_from_file(path):
+        if remaining_quota and processed >= remaining_quota:
+            break
+
+        url = f"https://allegro.pl/oferta/{offer_id}"
+        price = get_offer_price(offer_id)
+        polite_sleep()
+
+        if price is None:
+            prin
