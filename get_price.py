@@ -1,295 +1,316 @@
 # get_price.py
-# Hybryda: 1) szybki HTTP + regex (większość przypadków), 2) fallback Playwright (z retry i cookies).
-# Eksport:
-#   - EndedOfferError
-#   - get_price(auction_id) -> float
-#   - get_price_batch(auctions) -> (results:[{id,price,product}], errors:[str])
+from __future__ import annotations
+import json
+import re
+import time
+from typing import Dict, List, Tuple, Any
 
-from typing import List, Tuple, Dict, Optional
-import re, os, html
-import requests
-from contextlib import suppress
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# ===== Konfiguracja (możesz nadpisać ENV-ami) =================================
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/123.0.0.0 Safari/537.36")
+ALLEGRO_BASE = "https://allegro.pl/oferta/"
+NAV_TIMEOUT_MS = 30000
+SEL_TIMEOUT_MS = 8000
 
-ALLEGRO_URL_TMPL = "https://allegro.pl/oferta/{id}"
-
-FAST_HTTP_ENABLED     = os.getenv("FAST_HTTP_ENABLED", "1") == "1"
-HTTP_TIMEOUT          = float(os.getenv("HTTP_TIMEOUT", "8"))        # s
-
-PLAY_NAV_TIMEOUT_MS   = int(os.getenv("PLAY_NAV_TIMEOUT_MS", "30000"))
-PLAY_DEF_TIMEOUT_MS   = int(os.getenv("PLAY_DEF_TIMEOUT_MS", "8000"))
-PLAY_RETRIES          = int(os.getenv("PLAY_RETRIES", "2"))
-PLAY_AFTER_GOTO_WAIT  = int(os.getenv("PLAY_AFTER_GOTO_WAIT_MS", "350"))  # krótkie odsapnięcie po goto
-
-# ===== Specjalny wyjątek ======================================================
-
-class EndedOfferError(Exception):
-    """Aukcja zakończona/usunięta (stan miękki; sprawdź ponownie później)."""
-    pass
-
-# ===== Wzorce wykrywania ceny i zakończenia ==================================
-
-PRICE_PATTERNS = [
-    # JSON-y ze stanu strony
-    re.compile(r'"currentPrice"\s*:\s*\{\s*"amount"\s*:\s*"(?P<val>\d+(?:[.,]\d+)?)"', re.I),
-    re.compile(r'"lowestPrice"\s*:\s*\{\s*"amount"\s*:\s*"(?P<val>\d+(?:[.,]\d+)?)"', re.I),
-    re.compile(r'"price"\s*:\s*\{\s*"amount"\s*:\s*"(?P<val>\d+(?:[.,]\d+)?)"', re.I),
-    re.compile(r'"amount"\s*:\s*"(?P<val>\d+(?:[.,]\d+)?)"\s*,\s*"currency"', re.I),
-    # meta OG
-    re.compile(r'property=["\']og:price:amount["\']\s+content=["\'](?P<val>[^"\']+)["\']', re.I),
-    # fallback z tekstu: „od 39,99 zł”, „39,99–49,99 zł”
-    re.compile(r'(?P<val>\d{1,6}(?:[.,]\d{1,2})?)\s*(?:–|-|do)?\s*\d{0,6}(?:[.,]\d{1,2})?\s*zł', re.I),
+# Teksty/oznaki zakończonych/usuniętych ofert
+ENDED_HINTS = [
+    "oferta zakończona",
+    "oferta została zakończona",
+    "ogłoszenie zakończone",
+    "oferta nie istnieje",
+    "strona nie została znaleziona",
+    "404",
+    "410",
 ]
 
-ENDED_PATTERNS = [
-    re.compile(r'oferta (?:zosta[ła|l]a )?zakończona', re.I),
-    re.compile(r'nie znaleziono oferty', re.I),
-    re.compile(r'oferta została usunięta', re.I),
-    re.compile(r'\b404\b', re.I),
-    re.compile(r'\b410\b', re.I),
-]
 
-# ===== Utils =================================================================
+class EndedOfferError(RuntimeError):
+    """Rzucane gdy oferta wygląda na zakończoną/usuniętą."""
 
-def _to_float(s: str) -> float:
-    return float((s or "").replace("\xa0", "").replace(" ", "").replace(",", "."))
 
-def _extract_price_from_html(html_text: str) -> Optional[float]:
-    txt = html.unescape(html_text or "")
-    for rx in PRICE_PATTERNS:
-        m = rx.search(txt)
+def _to_float_price(s: str | None) -> float | None:
+    if not s:
+        return None
+    t = s.lower()
+    # usuń zł, spacje, twarde spacje, separatory tys., zamień przecinek na kropkę
+    t = t.replace("zł", "").replace("\xa0", "").replace(" ", "").replace(",", ".")
+    # wyciągnij pierwszą liczbę
+    m = re.search(r"(\d+(?:\.\d+)?)", t)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def _click_cookies(page) -> None:
+    # Allegro ma różne warianty CMP; próbujemy kilka popularnych przycisków
+    candidates = [
+        r"text=/.*(Zgadzam się|Akceptuj|Przejdź do serwisu|Akceptuję).*/i",
+        r'button:has-text("Zgadzam się")',
+        r'button:has-text("Akceptuj")',
+        r'button:has-text("Akceptuję")',
+        r'button:has-text("Przejdź do serwisu")',
+        r'[data-role="accept-consent"]',
+    ]
+    for sel in candidates:
+        try:
+            el = page.locator(sel)
+            if el.count() > 0:
+                el.first.click(timeout=2000)
+                # mała pauza, by DOM się zaktualizował
+                page.wait_for_timeout(200)
+                return
+        except Exception:
+            pass
+
+
+def _detect_ended(page) -> bool:
+    txt = (page.content() or "").lower()
+    return any(h in txt for h in ENDED_HINTS)
+
+
+def _extract_price(page) -> float | None:
+    # 1) Meta tag opengraph/product
+    try:
+        m = page.locator('meta[property="product:price:amount"]')
+        if m.count():
+            val = m.first.get_attribute("content")
+            p = _to_float_price(val)
+            if p is not None:
+                return p
+    except Exception:
+        pass
+
+    # 2) JSON-LD (offers.price)
+    try:
+        scripts = page.locator('script[type="application/ld+json"]')
+        for i in range(min(scripts.count(), 10)):
+            raw = scripts.nth(i).text_content() or ""
+            # Na stronach bywa kilka JSON-ów, czasem połączonych -> parsuj łagodnie
+            for chunk in _json_chunks(raw):
+                try:
+                    data = json.loads(chunk)
+                except Exception:
+                    continue
+                # czasem to lista
+                nodes = data if isinstance(data, list) else [data]
+                for node in nodes:
+                    price = _find_price_in_ldjson(node)
+                    if price is not None:
+                        return price
+    except Exception:
+        pass
+
+    # 3) Znane atrybuty w DOM
+    candidates = [
+        '[itemprop="price"]',
+        '[data-testid="price"]',
+        '[data-test="price"]',
+        '[data-box-name="price"]',
+        '[data-role="price"]',
+        'div:has-text("Cena") >> ..',  # czasem label + liczba wyżej/niżej
+    ]
+    for sel in candidates:
+        try:
+            el = page.locator(sel)
+            if el.count():
+                txt = el.first.text_content() or el.first.get_attribute("content") or ""
+                p = _to_float_price(txt)
+                if p is not None:
+                    return p
+        except Exception:
+            pass
+
+    # 4) Awaryjnie – poszukaj „zł” w widocznym tekście strony
+    try:
+        txt = page.inner_text("body")
+        # znajdź pierwszą liczbę zakończoną „zł”
+        m = re.search(r"(\d+[.,]?\d*)\s*zł", txt.lower())
         if m:
-            g = m.groupdict().get("val") or m.group(1)
-            return _to_float(g)
-    return None
-
-def _is_ended(html_text: str) -> bool:
-    txt = html.unescape(html_text or "")
-    return any(rx.search(txt) for rx in ENDED_PATTERNS)
-
-# ===== Szybka ścieżka HTTP ===================================================
-
-_HTTP = requests.Session()
-_HTTP.headers.update({
-    "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Connection": "keep-alive",
-})
-
-def _http_price(auction_id: str) -> float:
-    url = ALLEGRO_URL_TMPL.format(id=auction_id)
-    r = _HTTP.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
-    if r.status_code in (404, 410):
-        raise EndedOfferError(f"HTTP {r.status_code}")
-    r.raise_for_status()
-    if _is_ended(r.text):
-        raise EndedOfferError("oferta zakończona/usunięta")
-    price = _extract_price_from_html(r.text)
-    if price is None:
-        raise ValueError("HTTP: nie znaleziono ceny")
-    return price
-
-# ===== Playwright =============================================================
-
-def _new_context(p):
-    browser = p.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-        ],
-    )
-    ctx = browser.new_context(
-        locale="pl-PL",
-        user_agent=UA,
-        viewport={"width": 1366, "height": 900},
-    )
-    page = ctx.new_page()
-
-    # przyspieszenie: blokuj ciężkie zasoby
-    def _route_handler(route):
-        t = (route.request.resource_type or "").lower()
-        if t in ("image", "media", "font", "stylesheet"):
-            return route.abort()
-        return route.continue_()
-    page.route("**/*", _route_handler)
-
-    page.set_default_navigation_timeout(PLAY_NAV_TIMEOUT_MS)
-    page.set_default_timeout(PLAY_DEF_TIMEOUT_MS)
-    return browser, ctx, page
-
-def _accept_cookies_if_present(page: Page):
-    # próbujemy kilka wariantów — bez błędów jeśli brak
-    selectors = [
-        "button[data-role='accept-consent']",
-        "button:has-text('Przejdź do serwisu')",
-        "button:has-text('Akceptuj')",
-        "[data-testid='consent-modal'] button:has-text('Akcept')",
-    ]
-    for sel in selectors:
-        with suppress(Exception):
-            if page.locator(sel).count() > 0:
-                page.locator(sel).first.click(timeout=1500)
-                page.wait_for_timeout(150)  # krótko, żeby UI się domknął
-                break
-
-def _try_get_price_ui(page: Page) -> Optional[float]:
-    # zestaw szeroki — Allegro często zmienia testID-y
-    ui_selectors = [
-        "meta[itemprop='price']@content",  # notacja specjalna -> atrybut
-        "[data-testid='price-value']",
-        "[data-testid='price-primary']",
-        "span[data-testid*='price']",
-        "[itemprop='price']",
-        "[data-box-name='BuyNow'] [data-testid='price-value']",
-        "[data-box-name='Summary'] [data-testid*='price']",
-        "div[aria-label*='Cena']",
-    ]
-
-    # a) meta content
-    if "@content" in ui_selectors[0]:
-        with suppress(Exception):
-            meta = page.locator("meta[itemprop='price']")
-            if meta.count() > 0:
-                val = meta.first.get_attribute("content")
-                if val:
-                    return _to_float(val)
-
-    # b) widoczne elementy
-    for sel in ui_selectors[1:]:
-        with suppress(Exception):
-            loc = page.locator(sel)
-            if loc.count() == 0:
-                continue
-            txt = loc.first.inner_text(timeout=2500)
-            if txt and re.search(r"\d", txt):
-                return _to_float(txt)
+            return _to_float_price(m.group(1))
+    except Exception:
+        pass
 
     return None
 
-def _play_price_once(page: Page, auction_id: str) -> float:
-    url = ALLEGRO_URL_TMPL.format(id=auction_id)
-    page.goto(url, wait_until="domcontentloaded", timeout=PLAY_NAV_TIMEOUT_MS)
-    page.wait_for_timeout(PLAY_AFTER_GOTO_WAIT)
-    _accept_cookies_if_present(page)
 
-    html_text = page.content()
-    if _is_ended(html_text):
-        raise EndedOfferError("oferta zakończona/usunięta")
+def _json_chunks(raw: str) -> List[str]:
+    """
+    Niektóre strony mają kilka bloków JSON sklejonych; ta funkcja stara się
+    wydzielić „sensowne” fragmenty do json.loads.
+    """
+    chunks: List[str] = []
+    buf = []
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in raw:
+        buf.append(ch)
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    chunks.append("".join(buf).strip())
+                    buf = []
+    if chunks:
+        return chunks
+    # jeśli nie udało się, zwróć cały tekst — może i tak parsowalny
+    return [raw]
 
-    # 1) UI
-    p = _try_get_price_ui(page)
-    if p is not None:
-        return p
 
-    # 2) fallback: parsuj HTML (JSON-y osadzone)
-    p = _extract_price_from_html(html_text)
-    if p is not None:
-        return p
+def _find_price_in_ldjson(node: Any) -> float | None:
+    # Szukaj pól offers -> price / priceSpecification -> price
+    try:
+        offers = node.get("offers")
+        if isinstance(offers, list):
+            for o in offers:
+                p = _pull_price_from_offer(o)
+                if p is not None:
+                    return p
+        elif isinstance(offers, dict):
+            p = _pull_price_from_offer(offers)
+            if p is not None:
+                return p
+    except Exception:
+        pass
+    # Czasem cena siedzi bezpośrednio w „price”
+    try:
+        if "price" in node:
+            return _to_float_price(str(node["price"]))
+    except Exception:
+        pass
+    return None
 
-    # 3) ostania próba — dociągnij jeszcze trochę sieci
-    with suppress(Exception):
-        page.wait_for_load_state("networkidle", timeout=3500)
-        page.wait_for_timeout(200)
-        html_text = page.content()
-        p = _extract_price_from_html(html_text)
+
+def _pull_price_from_offer(o: Dict[str, Any]) -> float | None:
+    if not isinstance(o, dict):
+        return None
+    # price
+    if "price" in o:
+        p = _to_float_price(str(o["price"]))
         if p is not None:
             return p
+    # priceSpecification.price
+    ps = o.get("priceSpecification")
+    if isinstance(ps, dict) and "price" in ps:
+        p = _to_float_price(str(ps["price"]))
+        if p is not None:
+            return p
+    return None
 
-    raise RuntimeError(f"Playwright: brak ceny dla {url}")
 
-def _play_price(page: Page, auction_id: str) -> float:
-    last_exc = None
-    for attempt in range(1, PLAY_RETRIES + 1):
-        try:
-            return _play_price_once(page, auction_id)
-        except EndedOfferError:
-            raise
-        except PWTimeout as e:
-            last_exc = e
-            continue
-        except Exception as e:
-            last_exc = e
-            # szybka re-proba — Allegro bywa kapryśne
-            continue
-    raise RuntimeError(str(last_exc) if last_exc else "Playwright: nieznany błąd")
+def _nav_and_prepare(page, url: str) -> None:
+    page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+    page.set_default_timeout(SEL_TIMEOUT_MS)
+    page.goto(url, wait_until="domcontentloaded")
+    # akceptuj cookies (jeśli są)
+    _click_cookies(page)
+    # szybkie sprawdzenie, czy oferta nie jest zakończona
+    if _detect_ended(page):
+        raise EndedOfferError(f"ENDED: {url}")
 
-# ===== API: single ============================================================
 
-def get_price(auction_id: str) -> float:
-    auction_id = str(auction_id).strip()
-    if not auction_id.isdigit():
-        raise ValueError(f"Niepoprawne ID: {auction_id}")
+def _build_url(auction_id: str) -> str:
+    # pozwala przekazać pełny URL albo samo ID
+    if auction_id.startswith("http://") or auction_id.startswith("https://"):
+        return auction_id
+    return f"{ALLEGRO_BASE}{auction_id}"
 
-    if FAST_HTTP_ENABLED:
-        try:
-            return _http_price(auction_id)
-        except EndedOfferError:
-            raise
-        except Exception:
-            pass  # cichy fallback
 
-    with sync_playwright() as p:
-        browser, ctx, page = _new_context(p)
-        try:
-            return _play_price(page, auction_id)
-        finally:
-            with suppress(Exception):
-                ctx.close()
-                browser.close()
-
-# ===== API: batch =============================================================
-
-def get_price_batch(auctions: List[Dict]) -> Tuple[List[Dict], List[str]]:
+def get_price_single(page, auction: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Zwraca:
-      results: [{"id":"...", "price": 123.45, "product":"..."}]
-      errors:  ["opis błędu", ...]  # także ENDED
+    Zwraca {"id": "...", "price": float} albo rzuca EndedOfferError / RuntimeError.
     """
-    results: List[Dict] = []
-    errors:  List[str] = []
+    aid = str(auction["id"])
+    url = _build_url(aid)
 
-    # 1) HTTP najpierw (sekwencyjnie — stabilnie na hostingu)
-    pending: List[Dict] = []
-    if FAST_HTTP_ENABLED:
-        for a in auctions:
-            aid = str(a.get("id","")).strip()
+    try:
+        _nav_and_prepare(page, url)
+
+        # czasem Allegro dosyła cenę po chwili — dajmy mu odrobinę czasu
+        price = None
+        for _ in range(3):
+            price = _extract_price(page)
+            if price is not None:
+                break
+            page.wait_for_timeout(500)
+
+        if price is None:
+            # ostatnia próba po małym scrollu
             try:
-                p = _http_price(aid)
-                results.append({"id": aid, "price": float(p), "product": a.get("product","")})
-            except EndedOfferError as e:
-                errors.append(f"{a.get('product','')}: Błąd sprawdzania aukcji {aid}: ENDED: {e}")
+                page.mouse.wheel(0, 600)
+                page.wait_for_timeout(300)
+                price = _extract_price(page)
             except Exception:
-                pending.append(a)
-    else:
-        pending = list(auctions)
+                pass
 
-    # 2) Fallback: Playwright tylko dla trudnych przypadków
-    if pending:
-        with sync_playwright() as p:
-            browser, ctx, page = _new_context(p)
-            try:
-                for a in pending:
-                    aid = str(a.get("id","")).strip()
-                    try:
-                        pr = _play_price(page, aid)
-                        results.append({"id": aid, "price": float(pr), "product": a.get("product","")})
-                    except EndedOfferError as e:
-                        errors.append(f"{a.get('product','')}: Błąd sprawdzania aukcji {aid}: ENDED: {e}")
-                    except Exception as e:
-                        errors.append(f"{a.get('product','')}: Błąd sprawdzania aukcji {aid}: {e}")
-            finally:
-                with suppress(Exception):
-                    ctx.close()
-                    browser.close()
+        if price is None:
+            raise RuntimeError(f"Playwright: brak ceny dla {url}")
+
+        return {"id": aid, "price": float(price)}
+
+    except PlaywrightTimeoutError:
+        raise RuntimeError(f"Page.goto: Timeout {NAV_TIMEOUT_MS}ms exceeded.\nCall log:\n  - navigating to \"{url}\", waiting until \"domcontentloaded\"")
+    except EndedOfferError:
+        # propaguj, żeby main mógł miękko oznaczyć w cache
+        raise
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+
+def get_price_batch(auctions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Wejście: lista dictów co najmniej z kluczami: id, min_price, product
+    Wyjście: (results, errors)
+      - results: [{"id": "...", "price": float}, ...]
+      - errors:  [str, str, ...]  (czytelne komunikaty do logów)
+    """
+    results: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    if not auctions:
+        return results, errors
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(
+            locale="pl-PL",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+
+        try:
+            for a in auctions:
+                try:
+                    res = get_price_single(page, a)
+                    results.append(res)
+                except EndedOfferError as e:
+                    # oddajemy w errors — main i tak oznaczy ENDED miękko w cache
+                    errors.append(f"{a.get('product', '?')}: {str(e)}")
+                except Exception as e:
+                    errors.append(f"{a.get('product', '?')}: {str(e)}")
+                # drobna pauza, by nie walić w serwis zbyt szybko
+                page.wait_for_timeout(150)
+        finally:
+            context.close()
+            browser.close()
 
     return results, errors
