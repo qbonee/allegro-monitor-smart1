@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Dict, List, Tuple, Optional
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
@@ -26,7 +27,6 @@ def _parse_price_text(txt: str) -> Optional[float]:
     t = t.replace("zł", "").replace("pln", "")
     t = t.replace("\u00a0", " ")  # nbsp
     t = t.strip()
-    # wyciągnij pierwszą grupę cyfr z separatorem
     m = re.search(r"(\d[\d\s]*[.,]\d{1,2}|\d[\d\s]*)", t)
     if not m:
         return None
@@ -39,7 +39,7 @@ def _parse_price_text(txt: str) -> Optional[float]:
 
 def _extract_price_from_html(html: str) -> Optional[float]:
     """
-    Fallback: spróbuj z ld+json / price w treści HTML.
+    Fallback: spróbuj z ld+json / price w treści HTML lub strukturach stanowych.
     """
     # JSON-LD: "price":"123.45"
     m = re.search(r'"price"\s*:\s*"(?P<p>[\d.,\s]+)"', html)
@@ -55,7 +55,84 @@ def _extract_price_from_html(html: str) -> Optional[float]:
         if val is not None:
             return val
 
+    # Często w danych aplikacji:
+    # ..."currentPrice":{"amount":"123.45"...}
+    m = re.search(r'"currentPrice"\s*:\s*\{[^}]*"amount"\s*:\s*"(?P<p>[\d.,]+)"', html)
+    if m:
+        val = _parse_price_text(m.group("p"))
+        if val is not None:
+            return val
+
     return None
+
+
+def _click_consent_if_present(page) -> None:
+    """
+    Kliknij baner zgód, jeśli jest. Obsługa kilku wariantów.
+    Nie rzuca wyjątków.
+    """
+    try:
+        # typowe teksty na Allegro/OneTrust itp.
+        texts = [
+            r"Zgadzam się", r"Akceptuj", r"Akceptuję", r"Przejdź dalej",
+            r"OK", r"Rozumiem", r"Zaakceptuj wszystko", r"Przejdź do serwisu",
+        ]
+        for t in texts:
+            btn = page.get_by_role("button", name=re.compile(t, re.I))
+            if btn.count() > 0:
+                btn.first.click(timeout=1500)
+                # po kliknięciu daj chwilę na re-render
+                time.sleep(0.3)
+                break
+    except Exception:
+        pass
+
+    # czasem to nie jest button:
+    try:
+        loc = page.locator("text=/Zgadzam|Akceptuj|Przejdź dalej|Rozumiem/i").first
+        if loc.count() > 0:
+            loc.click(timeout=1500)
+            time.sleep(0.3)
+    except Exception:
+        pass
+
+
+def _wait_price_visible(page, timeout_ms: int = 8000) -> None:
+    """
+    Spróbuj doczekać się pojawienia ceny w którymś z typowych selektorów.
+    """
+    sels = [
+        '[data-testid="uc-price"]',
+        '[data-testid="price"]',
+        '[data-testid="price-value"]',
+        '[data-testid="price-primary"]',
+        '[itemprop="price"]',
+        'meta[itemprop="price"]',
+    ]
+    t_end = time.time() + (timeout_ms / 1000.0)
+    last_err = None
+    while time.time() < t_end:
+        for s in sels:
+            try:
+                loc = page.locator(s).first
+                if loc.count() == 0:
+                    continue
+                # jeżeli meta – nie czekamy na visible
+                if s.startswith("meta"):
+                    content = (loc.get_attribute("content") or "").strip()
+                    if _parse_price_text(content) is not None:
+                        return
+                else:
+                    # czekaj aż pojawi się niepusty tekst
+                    txt = (loc.inner_text(timeout=500) or "").strip()
+                    if _parse_price_text(txt) is not None:
+                        return
+            except Exception as e:
+                last_err = e
+                continue
+        time.sleep(0.15)
+    if last_err:
+        raise last_err
 
 
 def _extract_price_dom(page) -> Optional[float]:
@@ -71,8 +148,8 @@ def _extract_price_dom(page) -> Optional[float]:
         '[data-testid="price-primary"]',
         'div[data-testid="price-section"]',
         'div[data-testid="price-wrapper"]',
+        'meta[itemprop="price"]',   # atrybut content
         'span[class*="price"]',
-        # czasem aria-label zawiera cenę
         '[aria-label*="zł"]',
     ]
 
@@ -83,7 +160,10 @@ def _extract_price_dom(page) -> Optional[float]:
                 continue
 
             # tekst
-            txt = (loc.inner_text(timeout=500) or "").strip()
+            try:
+                txt = (loc.inner_text(timeout=600) or "").strip()
+            except Exception:
+                txt = ""
             val = _parse_price_text(txt)
             if val is not None:
                 return val
@@ -107,9 +187,24 @@ def _extract_price_dom(page) -> Optional[float]:
     # Fallback: z całego HTML (ld+json)
     try:
         html = page.content()
-        return _extract_price_from_html(html)
+        val = _extract_price_from_html(html)
+        if val is not None:
+            return val
     except Exception:
-        return None
+        pass
+
+    # Ostateczny ratunek: przeskanuj widoczny tekst strony
+    try:
+        body_txt = page.inner_text("body", timeout=800).lower()
+        m = re.search(r"(\d[\d\s]*[.,]\d{1,2})\s*zł", body_txt)
+        if m:
+            val = _parse_price_text(m.group(1))
+            if val is not None:
+                return val
+    except Exception:
+        pass
+
+    return None
 
 
 def _get_single(page, auction: Dict) -> Dict:
@@ -131,10 +226,17 @@ def _get_single(page, auction: Dict) -> Dict:
     if status in (404, 410):
         raise EndedOfferError(f"ENDED {aid} HTTP {status}")
 
-    # Allegro bywa ciężkie – delikatny wait na fragment DOM
+    # kliknij zgody, jeśli są
+    _click_consent_if_present(page)
+
+    # Allegro bywa ciężkie – krótki oddech pomaga
+    time.sleep(0.3)
+
+    # spróbuj doczekać się sensownej ceny
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=5000)
-    except PWTimeoutError:
+        _wait_price_visible(page, timeout_ms=7000)
+    except Exception:
+        # pomiń – i tak spróbujemy zczytać fallbackami
         pass
 
     price = _extract_price_dom(page)
@@ -180,10 +282,12 @@ def get_price_batch(auctions: List[Dict]) -> Tuple[List[Dict], List[str]]:
                 r = _get_single(page, a)
                 results.append(r)
             except EndedOfferError as e:
-                # sygnal zakończonej aukcji – nie traktujemy jako "twardy" błąd
                 errors.append(f"{product}: Aukcja zakończona {aid} ({e})")
             except PWTimeoutError:
-                errors.append(f"{product}: Page.goto: Timeout 30000ms exceeded.\nCall log:\n  - navigating to \"{ALLEGRO_URL.format(aid=aid)}\", waiting until \"domcontentloaded\"")
+                errors.append(
+                    f"{product}: Page.goto: Timeout 30000ms exceeded.\n"
+                    f"Call log:\n  - navigating to \"{ALLEGRO_URL.format(aid=aid)}\", waiting until \"domcontentloaded\""
+                )
             except Exception as e:
                 errors.append(f"{product}: {e}")
 
