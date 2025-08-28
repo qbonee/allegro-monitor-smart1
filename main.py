@@ -1,3 +1,4 @@
+# main.py
 import os
 import json
 import time
@@ -5,10 +6,15 @@ import importlib
 from datetime import datetime, timedelta
 from typing import List, Dict
 
+# ===== Konfiguracja ===========================================================
+
 ENDED_CACHE_PATH = os.getenv("ENDED_CACHE_PATH", "ended_cache.json")
 RECHECK_ENDED_HOURS = int(os.getenv("RECHECK_ENDED_HOURS", "72"))  # po ilu godzinach znów sprawdzać
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
 SLEEP_BETWEEN_BATCH = float(os.getenv("SLEEP_BETWEEN_BATCH", "0.5"))
+
+# Czytaj TYLKO ten plik .txt (domyślnie: Akwesan GR 0,5.txt)
+TARGET_FILE = os.getenv("TARGET_FILE", "Akwesan GR 0,5.txt")
 
 # ===== Helpers ===============================================================
 
@@ -17,41 +23,71 @@ def parse_price(text: str) -> float:
     return float(t)
 
 def load_auctions_from_files(folder: str = ".") -> List[Dict]:
+    """
+    Wczytuje TYLKO jeden plik z aukcjami: TARGET_FILE (np. 'Akwesan GR 0,5.txt').
+    Obsługuje oba formaty:
+      A) nagłówek 'cena minimalna:...' + ID w kolejnych liniach,
+      B) wiersze 'ID;MIN_CENA'
+    Usuwa duplikaty ID w ramach tego pliku.
+    """
+    filename = TARGET_FILE
+    filepath = os.path.join(folder, filename)
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Nie znaleziono pliku: {filepath}")
+
     auctions: List[Dict] = []
-    for filename in os.listdir(folder):
-        if not filename.endswith(".txt"):
-            continue
-        filepath = os.path.join(folder, filename)
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-            if not lines:
-                continue
-            product = filename.replace(".txt", "")
-            if any(";" in ln for ln in lines):  # Format B
-                for ln in lines:
-                    if ";" not in ln:
-                        continue
-                    auction_id, min_price = ln.split(";", 1)
-                    auctions.append({"id": auction_id.strip(), "min_price": parse_price(min_price), "product": product})
-                continue
-            header = lines[0].lower()  # Format A
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        if not lines:
+            print(f"[WARN] Plik {filename} jest pusty.")
+            return []
+
+        product = filename.replace(".txt", "")
+
+        # Format B (z separatorem ';')
+        if any(";" in ln for ln in lines):
+            for ln in lines:
+                if ";" not in ln:
+                    continue
+                auction_id, min_price = ln.split(";", 1)
+                auctions.append({
+                    "id": auction_id.strip(),
+                    "min_price": parse_price(min_price),
+                    "product": product
+                })
+        else:
+            # Format A (pierwsza linia 'cena minimalna: ...', reszta to ID)
+            header = lines[0].lower()
             if header.startswith("cena minimalna:"):
                 min_price = parse_price(header.split(":", 1)[1])
                 for auction_id in lines[1:]:
-                    auctions.append({"id": auction_id.strip(), "min_price": min_price, "product": product})
-        except Exception as e:
-            print(f"[WARN] Nie udało się wczytać pliku {filename}: {e}")
+                    auctions.append({
+                        "id": auction_id.strip(),
+                        "min_price": min_price,
+                        "product": product
+                    })
+            else:
+                raise ValueError(
+                    f"Pierwsza linia w {filename} nie zaczyna się od 'cena minimalna:' "
+                    f"i nie stwierdzono formatu z ';'."
+                )
 
-    # de-duplikacja
+    except Exception as e:
+        print(f"[WARN] Nie udało się wczytać pliku {filename}: {e}")
+        return []
+
+    # de-duplikacja po (product, id)
     seen = set()
     uniq: List[Dict] = []
     for a in auctions:
         key = (a["product"], a["id"])
-        if key in seen:  # zostaw pierwszy
+        if key in seen:
             continue
         seen.add(key)
         uniq.append(a)
+
+    print(f"[INFO] (Single-file) Wczytano {len(uniq)} aukcji z pliku '{filename}'")
     return uniq
 
 def _chunk(lst: List[Dict], n: int) -> List[List[Dict]]:
@@ -100,11 +136,11 @@ def main():
     # get_price (batch) + typ wyjątku zakończenia
     gp = importlib.import_module("get_price")
     get_price_batch = getattr(gp, "get_price_batch")
-    EndedOfferError = getattr(gp, "EndedOfferError", RuntimeError)
+    EndedOfferError = getattr(gp, "EndedOfferError", RuntimeError)  # dostępny, gdyby był potrzebny
 
     auctions = load_auctions_from_files(".")
     total = len(auctions)
-    print(f"[INFO] Wczytano {total} wpisów .txt")
+    print(f"[INFO] Wczytano {total} wpisów z pliku")
     if total == 0:
         print("[INFO] Nic do sprawdzenia.")
         return
@@ -124,9 +160,13 @@ def main():
     alerts: List[Dict] = []
     errors: List[str] = []
 
-    chunks = _chunk(to_check, BATCH_SIZE)
+    # Przyjazne testom parametry dla jednego pliku (mniejsze batch i brak sleep)
+    batch_size = min(BATCH_SIZE, 5)
+    sleep_between = 0.0
+
+    chunks = _chunk(to_check, batch_size)
     all_batches = len(chunks)
-    print(f"[INFO] Tryb BATCH: {all_batches} partii po maks {BATCH_SIZE} aukcji")
+    print(f"[INFO] Tryb BATCH: {all_batches} partii po maks {batch_size} aukcji")
 
     processed = 0
     for i, chunk in enumerate(chunks, 1):
@@ -138,7 +178,7 @@ def main():
         for msg in errs or []:
             s = str(msg)
             if ("ENDED" in s) or ("zakończon" in s) or ("usunięt" in s) or ("HTTP 404" in s) or ("HTTP 410" in s):
-                # spróbuj wyłuskać ID; jeśli nie, oznaczamy cały chunk (bezpiecznie i rzadko)
+                # spróbuj wyłuskać ID; jeśli nie, oznaczamy cały chunk
                 found = False
                 for a in chunk:
                     if a["id"] in s:
@@ -163,7 +203,7 @@ def main():
 
         processed += len(chunk)
         print(f"[PROGRESS] Batch {i}/{all_batches} OK w {dt:.1f}s — przetworzono {processed}/{len(to_check)}")
-        time.sleep(SLEEP_BETWEEN_BATCH)
+        time.sleep(sleep_between)
 
     # zapisz cache zakończonych
     save_ended_cache(ended_cache)
