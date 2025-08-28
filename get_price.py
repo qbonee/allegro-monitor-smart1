@@ -3,18 +3,16 @@
 Allegro price watcher dla cron workera.
 
 Format plików wejściowych (*.txt):
-  1. linia:  'cena minimalna: 40zł'   (wartość progu w PLN)
+  1. linia:  'cena minimalna: 40zł'
   2..n linie: ID oferty Allegro (lub pełny URL https://allegro.pl/oferta/ID)
 
-Domyślnie skrypt sprawdza wszystkie *.txt w katalogu repo.
-Aby ograniczyć do jednego pliku (np. do testów): ustaw ENV TARGET_FILE_BASENAME="Akwesan Starter"
+Eksportuje:
+  - get_price_batch(*args, **kwargs)  # używane przez worker/main.py
+  - main()                             # uruchomienie ręczne
 
-Skrypt nie omija CAPTCHA — używa pojedynczych, rzadkich żądań HTTP.
-Ma wbudowane: jitter, limit na przebieg, backoff na 403/429 i detekcję podejrzenia CAPTCHA.
-
-Wymagane ENV (SMTP):
+ENV (wymagane SMTP):
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_TO
-Opcjonalne ENV:
+ENV (opcjonalne):
   MAIL_FROM, MAIL_FROM_NAME, EMAIL_SUBJECT, EMAIL_HTML,
   TARGET_FILE_BASENAME="Akwesan Starter",
   BASE_DELAY=0.8, JITTER=0.8, MAX_PER_RUN=0,
@@ -27,20 +25,20 @@ from email.mime.text import MIMEText
 from typing import Optional, Dict, Any, Iterator, Tuple, Iterable
 import requests
 
-# ---- grzeczne tempo / limity ----
-BASE_DELAY = float(os.environ.get("BASE_DELAY", "0.8"))      # bazowa pauza między żądaniami
-JITTER     = float(os.environ.get("JITTER", "0.8"))          # losowy dodatek/odjęcie (0..JITTER)
-MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "0"))        # ile ID maks. na jeden przebieg; 0=bez limitu
-BACKOFF_START = float(os.environ.get("BACKOFF_START", "5"))  # przy 403/429/captcha
+# ---- tempo / limity ----
+BASE_DELAY = float(os.environ.get("BASE_DELAY", "0.8"))
+JITTER     = float(os.environ.get("JITTER", "0.8"))
+MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "0"))
+BACKOFF_START = float(os.environ.get("BACKOFF_START", "5"))
 BACKOFF_MAX   = float(os.environ.get("BACKOFF_MAX", "900"))
 
 # ---- pliki / ścieżki ----
 ROOT = pathlib.Path(__file__).parent.resolve()
 STATE_PATH = pathlib.Path(os.environ.get("STATE_PATH", str(ROOT / "state.json")))
-TARGET_FILE = os.environ.get("TARGET_FILE_BASENAME")  # np. "Akwesan Starter" (bez .txt)
+TARGET_FILE = os.environ.get("TARGET_FILE_BASENAME")  # np. "Akwesan Starter"
 
 # ---- HTTP ----
-UA   = "Mozilla/5.0 (compatible; AllegroWatcher/1.4; cron-worker)"
+UA   = "Mozilla/5.0 (compatible; AllegroWatcher/1.5; cron-worker)"
 HDRS = {"User-Agent": UA, "Accept-Language": "pl-PL,pl;q=0.9"}
 session = requests.Session()
 
@@ -106,7 +104,7 @@ def iter_ids_from_file(path: pathlib.Path) -> Iterator[Tuple[str, int]]:
         yield offer_id, i
 
 def polite_sleep():
-    delay = BASE_DELAY + random.uniform(0, JITTER if JITTER > 0 else 0)
+    delay = BASE_DELAY + random.uniform(0, max(JITTER, 0))
     if delay > 0:
         time.sleep(delay)
 
@@ -194,16 +192,17 @@ def send_email(to_addr: str, subject: str, html: str) -> None:
 
 def process_one_file(path: pathlib.Path, state: Dict[str, Any],
                      email_to: str, subject_tmpl: str, body_tmpl: str,
-                     remaining_quota: int) -> int:
-    """Zwraca ile ID jeszcze możesz przerobić po tym pliku (quota)."""
+                     remaining_quota: int) -> Tuple[int, int]:
+    """Przerób jeden plik. Zwraca (processed_count, alerts_count)."""
     try:
         threshold = read_threshold(path)
     except Exception as e:
         print(str(e))
-        return remaining_quota
+        return 0, 0
 
     alerts = state.setdefault("alerts", {})
     processed = 0
+    alerts_sent = 0
 
     for offer_id, line_no in iter_ids_from_file(path):
         if remaining_quota and processed >= remaining_quota:
@@ -235,6 +234,7 @@ def process_one_file(path: pathlib.Path, state: Dict[str, Any],
             try:
                 send_email(email_to, subject_tmpl.format(offer_id=offer_id), html)
                 alerts[offer_id] = {"price": float(price), "ts": int(time.time())}
+                alerts_sent += 1
                 print(f"[{offer_id}] ALERT wysłany do {email_to}")
             except Exception as e:
                 print(f"[{offer_id}] Błąd wysyłki maila: {e}")
@@ -244,9 +244,11 @@ def process_one_file(path: pathlib.Path, state: Dict[str, Any],
 
         processed += 1
 
-    return (remaining_quota - processed) if remaining_quota else 0
+    return processed, alerts_sent
 
-def main() -> None:
+def run_once(target_file_basename: Optional[str] = None,
+             max_per_run: int = None) -> Dict[str, int]:
+    """Wykonaj jeden przebieg skanowania. Zwraca podsumowanie."""
     email_to = os.environ.get("EMAIL_TO")
     subject_tmpl = os.environ.get("EMAIL_SUBJECT", "🔥 Spadek ceny: {offer_id}")
     body_tmpl = os.environ.get(
@@ -256,27 +258,56 @@ def main() -> None:
         "<p>Plik: {file} (linia {line})</p>"
     )
 
+    global TARGET_FILE
+    if target_file_basename:  # pozwól nadpisać z argumentu
+        TARGET_FILE = target_file_basename
+
     state = load_state()
-    any_alert = False
 
     files = list(find_txt_files())
     if not files:
         print("Brak plików *.txt w katalogu roboczym.")
-        return
+        return {"files": 0, "checked": 0, "alerts": 0}
 
-    quota = MAX_PER_RUN if MAX_PER_RUN > 0 else 0
+    quota = max_per_run if (max_per_run is not None) else (MAX_PER_RUN if MAX_PER_RUN > 0 else 0)
+    total_checked = 0
+    total_alerts  = 0
+    state_changed = False
+
     for path in files:
         before = json.dumps(state, ensure_ascii=False)
-        quota = process_one_file(path, state, email_to, subject_tmpl, body_tmpl, quota)
+        processed, alerts_sent = process_one_file(
+            path, state, email_to, subject_tmpl, body_tmpl, quota if quota else 0
+        )
+        total_checked += processed
+        total_alerts  += alerts_sent
         after = json.dumps(state, ensure_ascii=False)
         if before != after:
-            any_alert = True
-        if quota == 0 and MAX_PER_RUN > 0:
-            print(f"Osiągnięto limit MAX_PER_RUN={MAX_PER_RUN} — kończę ten przebieg.")
-            break
+            state_changed = True
+        if quota:
+            quota = max(quota - processed, 0)
+            if quota == 0:
+                print(f"Osiągnięto limit MAX_PER_RUN — kończę ten przebieg.")
+                break
 
-    if any_alert:
+    if state_changed:
         save_state(state)
+
+    return {"files": len(files), "checked": total_checked, "alerts": total_alerts}
+
+# === API dla workera ===
+def get_price_batch(*args, **kwargs) -> Dict[str, int]:
+    """
+    Funkcja oczekiwana przez Twój worker (`main.py`/`worker_loop.py`).
+    Parametry są opcjonalne i ignorowane, żeby nie wiązać interfejsu.
+    Zwraca słownik podsumowania: {'files': X, 'checked': Y, 'alerts': Z}
+    """
+    return run_once()
+
+# === uruchomienie ręczne ===
+def main():
+    summary = run_once()
+    print(f"Podsumowanie: {summary}")
 
 if __name__ == "__main__":
     main()
