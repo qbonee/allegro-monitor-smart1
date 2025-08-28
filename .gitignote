@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+
+# Konfiguracje lokalne
+.env
+state.json
