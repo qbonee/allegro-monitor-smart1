@@ -103,14 +103,22 @@ def _extract_price(page) -> float | None:
     except Exception:
         pass
 
-    # 3) Znane atrybuty w DOM
+        # 3) Znane atrybuty w DOM (rozszerzona lista)
     candidates = [
         '[itemprop="price"]',
         '[data-testid="price"]',
+        '[data-testid="price-value"]',
+        '[data-testid="price-primary"]',
+        '[data-testid="uc-price"]',
         '[data-test="price"]',
         '[data-box-name="price"]',
         '[data-role="price"]',
-        'div:has-text("Cena") >> ..',  # czasem label + liczba wyżej/niżej
+        'div[data-testid="price-section"]',
+        'div[data-testid="price-wrapper"]',
+        'span[class*="price"]',
+        'div:has-text("Cena") >> ..',
+    ]
+
     ]
     for sel in candidates:
         try:
@@ -314,3 +322,4 @@ def get_price_batch(auctions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             browser.close()
 
     return results, errors
+
