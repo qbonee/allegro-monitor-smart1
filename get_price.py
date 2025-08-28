@@ -214,4 +214,69 @@ def process_one_file(path: pathlib.Path, state: Dict[str, Any],
         polite_sleep()
 
         if price is None:
-            prin
+            print(f"[{offer_id}] Nie udało się odczytać ceny ({path.name}:{line_no}).")
+            processed += 1
+            continue
+
+        print(f"[{offer_id}] Cena={price:.2f} zł | Próg={threshold:.2f} zł | {path.name}:{line_no}")
+
+        last = alerts.get(offer_id, {}).get("price")
+        should_alert = price <= threshold and (last is None or price < float(last))
+
+        if should_alert:
+            html = body_tmpl.format(
+                offer_id=offer_id,
+                price=f"{price:.2f}",
+                threshold=f"{threshold:.2f}",
+                url=url,
+                file=path.name,
+                line=line_no,
+            )
+            try:
+                send_email(email_to, subject_tmpl.format(offer_id=offer_id), html)
+                alerts[offer_id] = {"price": float(price), "ts": int(time.time())}
+                print(f"[{offer_id}] ALERT wysłany do {email_to}")
+            except Exception as e:
+                print(f"[{offer_id}] Błąd wysyłki maila: {e}")
+        else:
+            if last is None or price < float(last):
+                alerts[offer_id] = {"price": float(price), "ts": int(time.time())}
+
+        processed += 1
+
+    return (remaining_quota - processed) if remaining_quota else 0
+
+def main() -> None:
+    email_to = os.environ.get("EMAIL_TO")
+    subject_tmpl = os.environ.get("EMAIL_SUBJECT", "🔥 Spadek ceny: {offer_id}")
+    body_tmpl = os.environ.get(
+        "EMAIL_HTML",
+        "<h2>Oferta {offer_id} spadła do {price} zł (próg {threshold} zł)</h2>"
+        "<p><a href='{url}'>Przejdź do oferty</a></p>"
+        "<p>Plik: {file} (linia {line})</p>"
+    )
+
+    state = load_state()
+    any_alert = False
+
+    files = list(find_txt_files())
+    if not files:
+        print("Brak plików *.txt w katalogu roboczym.")
+        return
+
+    quota = MAX_PER_RUN if MAX_PER_RUN > 0 else 0
+    for path in files:
+        before = json.dumps(state, ensure_ascii=False)
+        quota = process_one_file(path, state, email_to, subject_tmpl, body_tmpl, quota)
+        after = json.dumps(state, ensure_ascii=False)
+        if before != after:
+            any_alert = True
+        if quota == 0 and MAX_PER_RUN > 0:
+            print(f"Osiągnięto limit MAX_PER_RUN={MAX_PER_RUN} — kończę ten przebieg.")
+            break
+
+    if any_alert:
+        save_state(state)
+
+if __name__ == "__main__":
+    main()
