@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Dict, List, Tuple, Optional
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-
 ALLEGRO_URL = "https://allegro.pl/oferta/{aid}"
+DEBUG = os.getenv("DEBUG_PRICE", "0") == "1"
 
 # ------------------------------- utils ------------------------------------- #
 
@@ -20,7 +21,12 @@ class EndedOfferError(RuntimeError):
 def _parse_price_text(txt: str) -> Optional[float]:
     if not txt:
         return None
-    t = txt.lower().replace("zł", "").replace("pln", "").replace("\u00a0", " ")
+    t = (
+        txt.lower()
+        .replace("zł", "")
+        .replace("pln", "")
+        .replace("\u00a0", " ")
+    )
     t = re.sub(r"[^\d,.\s]", "", t).strip()
     m = re.search(r"(\d[\d\s]*[.,]\d{1,2}|\d[\d\s]*)", t)
     if not m:
@@ -38,17 +44,14 @@ def _json_find_price(obj) -> Optional[float]:
         if obj is None:
             return None
         if isinstance(obj, (int, float)):
-            # odrzuć zbyt małe wartości (np. 0/1)
             return float(obj) if obj > 0.01 else None
         if isinstance(obj, str):
             return _parse_price_text(obj)
         if isinstance(obj, dict):
-            # popularne klucze na Allegro
             for k in ("price", "amount", "currentPrice", "sellingMode", "buyNowPrice", "minPrice", "value"):
                 if k in obj:
                     v = obj[k]
                     if isinstance(v, dict):
-                        # np. {"amount":"123.45","currency":"PLN"}
                         for kk in ("amount", "price", "value"):
                             if kk in v:
                                 pv = _json_find_price(v[kk])
@@ -58,7 +61,6 @@ def _json_find_price(obj) -> Optional[float]:
                         pv = _json_find_price(v)
                         if pv is not None:
                             return pv
-            # generalny przegląd
             for v in obj.values():
                 pv = _json_find_price(v)
                 if pv is not None:
@@ -74,25 +76,30 @@ def _json_find_price(obj) -> Optional[float]:
 
 
 def _extract_price_from_html(html: str) -> Optional[float]:
-    # JSON-LD: "price":"123.45"
-    m = re.search(r'"price"\s*:\s*"(?P<p>[\d.,\s]+)"', html)
-    if m:
-        v = _parse_price_text(m.group("p"))
-        if v is not None:
-            return v
-    # JSON-LD: "price":123.45
-    m = re.search(r'"price"\s*:\s*(?P<p>\d[\d.,\s]*)', html)
-    if m:
-        v = _parse_price_text(m.group("p"))
-        if v is not None:
-            return v
-    # ... "currentPrice":{"amount":"123.45"...}
-    m = re.search(r'"currentPrice"\s*:\s*\{[^}]*"amount"\s*:\s*"(?P<p>[\d.,]+)"', html)
-    if m:
-        v = _parse_price_text(m.group("p"))
-        if v is not None:
-            return v
+    pats = [
+        r'"price"\s*:\s*"(?P<p>[\d.,\s]+)"',
+        r'"price"\s*:\s*(?P<p>\d[\d.,\s]*)',
+        r'"currentPrice"\s*:\s*\{[^}]*"amount"\s*:\s*"(?P<p>[\d.,]+)"',
+        r'"amount"\s*:\s*"(?P<p>[\d.,]+)"\s*,\s*"currency"\s*:\s*"(?:PLN|zł)"',
+        r'"buyNowPrice"\s*:\s*\{[^}]*"amount"\s*:\s*"(?P<p>[\d.,]+)"',
+    ]
+    for pat in pats:
+        m = re.search(pat, html)
+        if m:
+            v = _parse_price_text(m.group("p"))
+            if v is not None:
+                return v
     return None
+
+
+def _dbg(page, msg: str) -> None:
+    if not DEBUG:
+        return
+    try:
+        url = page.url
+    except Exception:
+        url = "(no url)"
+    print(f"[DEBUG] {msg} | URL={url}")
 
 
 def _click_consent_everywhere(page) -> None:
@@ -107,12 +114,11 @@ def _click_consent_everywhere(page) -> None:
             for t in texts:
                 b = p.get_by_role("button", name=re.compile(t, re.I))
                 if b.count() > 0:
-                    b.first.click(timeout=1000)
+                    b.first.click(timeout=1200)
                     return True
-            # alternatywnie klik po tekście
             loc = p.locator("text=/Zgadzam|Akceptuj|Przejdź dalej|Rozumiem|Accept/i").first
             if loc.count() > 0:
-                loc.click(timeout=1000)
+                loc.click(timeout=1200)
                 return True
         except Exception:
             return False
@@ -120,14 +126,15 @@ def _click_consent_everywhere(page) -> None:
 
     clicked = try_click(page)
     if clicked:
+        _dbg(page, "Kliknięto zgodę w głównej stronie")
         time.sleep(0.3)
 
-    # czasem baner jest w iframie (np. consent manager)
     try:
         for fr in page.frames:
             if fr is page.main_frame:
                 continue
             if try_click(fr):
+                _dbg(page, "Kliknięto zgodę w iframie")
                 time.sleep(0.3)
                 break
     except Exception:
@@ -137,9 +144,9 @@ def _click_consent_everywhere(page) -> None:
 def _wait_price_visible(page, timeout_ms: int = 9000) -> None:
     sels = [
         '[data-testid="uc-price"]',
+        '[data-testid="price-primary"]',
         '[data-testid="price"]',
         '[data-testid="price-value"]',
-        '[data-testid="price-primary"]',
         '[itemprop="price"]',
         'meta[itemprop="price"]',
         'span[class*="price"]',
@@ -159,7 +166,7 @@ def _wait_price_visible(page, timeout_ms: int = 9000) -> None:
                         return
             except Exception:
                 pass
-        time.sleep(0.15)
+        time.sleep(0.12)
 
 
 def _extract_price_dom(page) -> Optional[float]:
@@ -199,7 +206,6 @@ def _extract_price_dom(page) -> Optional[float]:
         except Exception:
             continue
 
-    # Fallback: HTML
     try:
         html = page.content()
         v = _extract_price_from_html(html)
@@ -208,7 +214,6 @@ def _extract_price_dom(page) -> Optional[float]:
     except Exception:
         pass
 
-    # Ostateczny: skan tekstu strony
     try:
         body_txt = page.inner_text("body", timeout=800)
         m = re.search(r"(\d[\d\s]*[.,]\d{1,2})\s*zł", body_txt.lower())
@@ -227,18 +232,23 @@ def _extract_price_via_js_state(page) -> Optional[float]:
     try:
         js = """
         () => {
-          const g = (w, keys) => {
-            for (const k of keys) if (w && w[k]) return w[k];
-            return null;
-          };
-        const w = window;
-        const candidates = [
-          g(w, ["__APP_STATE__", "__INITIAL_STATE__", "__NEXT_DATA__", "__STATE__"]),
-          ...Array.from(document.querySelectorAll("script")).map(s => {
-            try { return JSON.parse(s.textContent); } catch (e) { return null; }
-          })
-        ].filter(Boolean);
-        return candidates;
+          const out = [];
+          const pick = (w, keys) => { for (const k of keys) if (w && w[k]) return w[k]; return null; };
+          const cand = [
+            pick(window, ["__APP_STATE__", "__INITIAL_STATE__", "__NEXT_DATA__", "__STATE__"])
+          ];
+          // wszystkie <script> z JSON
+          for (const s of Array.from(document.querySelectorAll("script"))) {
+            try {
+              const t = s.textContent || "";
+              if (t.trim().startsWith("{") || t.trim().startsWith("[")) {
+                out.push(JSON.parse(t));
+              }
+            } catch(e) {}
+          }
+          const st = pick(window, ["__APP_STATE__", "__INITIAL_STATE__", "__NEXT_DATA__", "__STATE__"]);
+          if (st) out.unshift(st);
+          return out;
         }
         """
         states = page.evaluate(js)
@@ -253,16 +263,46 @@ def _extract_price_via_js_state(page) -> Optional[float]:
     return None
 
 
+def _diagnose(page):
+    if not DEBUG:
+        return
+    try:
+        sels = [
+            '[data-testid="uc-price"]',
+            '[data-testid="price-primary"]',
+            '[data-testid="price"]',
+            '[data-testid="price-value"]',
+            '[itemprop="price"]',
+            'meta[itemprop="price"]',
+            'span[class*="price"]',
+        ]
+        for s in sels:
+            try:
+                c = page.locator(s).count()
+                txt = ""
+                if c:
+                    try:
+                        txt = page.locator(s).first.inner_text(timeout=400)
+                    except Exception:
+                        pass
+                print(f"[DEBUG] sel={s} count={c} text='{txt[:120]}'")
+            except Exception:
+                pass
+        html = page.content()
+        print("[DEBUG] HTML head:", html[:3000].replace("\n", " ")[:3000])
+    except Exception:
+        pass
+
+
 def _get_single(page, auction: Dict) -> Dict:
     aid = str(auction["id"]).strip()
     url = ALLEGRO_URL.format(aid=aid)
 
-    # 1) wejście: najpierw spróbuj mocniej dociągnąć sieć
+    # wejście
     resp = None
     try:
         resp = page.goto(url, timeout=60000, wait_until="networkidle")
     except PWTimeoutError:
-        # retry lżejszy
         resp = page.goto(url, timeout=30000, wait_until="domcontentloaded")
 
     status = None
@@ -274,25 +314,28 @@ def _get_single(page, auction: Dict) -> Dict:
     if status in (404, 410):
         raise EndedOfferError(f"ENDED {aid} HTTP {status}")
 
-    # 2) zgody (główna + iframy)
     _click_consent_everywhere(page)
+    time.sleep(0.35)  # hydracja
 
-    # 3) krótka pauza na hydrację
-    time.sleep(0.4)
+    # delikatny scroll — Allegro często dosyła treść po pierwszym ruchu
+    try:
+        page.evaluate("()=>window.scrollBy(0, 300)")
+    except Exception:
+        pass
+    time.sleep(0.2)
 
-    # 4) czekaj aż pojawi się cena (jeśli ma się pojawić w DOM)
     try:
         _wait_price_visible(page, timeout_ms=9000)
     except Exception:
         pass
 
-    # 5) najpierw spróbuj z JS state
+    # najpierw stany JS, potem DOM/HTML
     price = _extract_price_via_js_state(page)
     if price is None:
-        # 6) DOM/HTML/tekst
         price = _extract_price_dom(page)
 
     if price is None:
+        _diagnose(page)
         raise RuntimeError(f"Playwright: brak ceny dla {url}")
 
     return {"id": aid, "price": float(price)}
